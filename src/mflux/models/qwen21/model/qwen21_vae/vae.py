@@ -1,3 +1,5 @@
+import os
+
 import mlx.core as mx
 from mlx import nn
 
@@ -61,6 +63,32 @@ class Decoder(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.mid_block(VAEOperations.conv(self.conv_in, x, self.text_mode))
+        rows = Decoder.strip_rows()
+        if self.text_mode or not rows or x.shape[1] <= rows + 2 * Decoder.HALO:
+            return self._upsample(x)
+        # Row strips: after the mid block (the only global op) every layer is a 3x3 convolution, a nearest
+        # upsample or a per-pixel channel norm, so each output row depends on ~12.3 latent rows around it.
+        # Decoding strips of `rows` latent rows with HALO rows of context on each side gives the same pixels
+        # and bounds the full-resolution float32 activations to one strip.
+        mx.eval(x)
+        height, scale = x.shape[1], 2 ** sum(block.upsampler is not None for block in self.up_blocks)
+        strips = []
+        for top in range(0, height, rows):
+            bottom = min(height, top + rows)
+            a, b = max(0, top - Decoder.HALO), min(height, bottom + Decoder.HALO)
+            strip = self._upsample(x[:, a:b])[:, (top - a) * scale : (bottom - a) * scale]
+            mx.eval(strip)
+            strips.append(strip)
+        return mx.concatenate(strips, axis=1)
+
+    HALO = 16  # latent rows; the receptive field of the upsampling stack is ~12.3
+
+    @staticmethod
+    def strip_rows() -> int:
+        # Latent rows per strip (MFLUX_QWEN21_VAE_STRIP_ROWS; 0 = whole image at once, the upstream behaviour).
+        return int(os.environ.get("MFLUX_QWEN21_VAE_STRIP_ROWS", "0"))
+
+    def _upsample(self, x: mx.array) -> mx.array:
         for block in self.up_blocks:
             x = block(x)
             if not self.text_mode:
