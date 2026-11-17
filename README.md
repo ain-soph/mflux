@@ -5,8 +5,8 @@
 > - `MFLUX_ZERO_COPY_STREAM=1` gives each Qwen-Image-2.1 DiT block / Qwen3-VL text layer its weights only while it runs.
 >   MLX keeps every live buffer resident during GPU work, so this (with an MLX cache limit of ~2 GB) cuts the wired peak
 >   of a generation from 44-52 GB to ~12 GB at 1024x1024 on an M5 Ultra, same speed, byte-identical images.
-> - `MFLUX_QWEN21_VAE_STRIP_ROWS=N` decodes the Qwen-Image-2.1 VAE in row strips (exact up to float rounding):
->   2048x2048 extra decode memory 35.5 GB -> ~1 GB at N=16.
+> - `MFLUX_QWEN21_VAE_STRIP_ROWS=N` (+ `MFLUX_QWEN21_VAE_STRIP_FROM=2`) decodes the Qwen-Image-2.1 VAE in row strips,
+>   two passes (exact up to float rounding): wired peak of a 2752x1536 Turbo generation 21.5 -> 8.9 GB.
 
 ![image](src/mflux/assets/logo.jpg)
 
