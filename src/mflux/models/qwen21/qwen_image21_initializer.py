@@ -106,7 +106,7 @@ class QwenImage21Initializer:
 
         Qwen21Initializer.load_components(model, root, definition, quantize, validate=True)
         if w8a8 is not None:
-            qwen21_w8a8.load(model.transformer, w8a8)
+            qwen21_w8a8.load(model.transformer, w8a8, root / "transformer")
         if te_w8a8 is not None:
             qwen21_w8a8.load_text_encoder(model.text_encoder, te_w8a8)
         Qwen21Initializer.apply_lora(model, lora_paths, lora_scales, bake_lora)

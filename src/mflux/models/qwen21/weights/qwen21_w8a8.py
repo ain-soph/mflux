@@ -26,6 +26,23 @@ PROJECTIONS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.
 FUSED = {"img_mlp.gate_up": ("img_mlp.gate_layer", "img_mlp.proj")}
 
 
+# MFLUX_QWEN21_W8A8_CLASSES=qkv,out,gateup,down (default: all): which projection groups run W8A8; the others keep the
+# bfloat16 weights of the checkpoint's transformer/ (W8A8 only where it is faster, 2026-11-17).
+CLASS_GROUPS = {"qkv": ("attn.to_q", "attn.to_k", "attn.to_v"), "out": ("attn.to_out.0",),
+                "gateup": ("img_mlp.gate_layer", "img_mlp.proj"), "down": ("img_mlp.out",)}
+
+
+def selected() -> tuple[str, ...]:
+    names = os.environ.get("MFLUX_QWEN21_W8A8_CLASSES")
+    if not names:
+        return PROJECTIONS
+    unknown = [n for n in names.split(",") if n not in CLASS_GROUPS]
+    if unknown:
+        raise ValueError(f"MFLUX_QWEN21_W8A8_CLASSES: unknown groups {unknown}; use {sorted(CLASS_GROUPS)}")
+    pick = {p for n in names.split(",") for p in CLASS_GROUPS[n]}
+    return tuple(p for p in PROJECTIONS if p in pick)
+
+
 TEXT_PROJECTIONS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                     "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
 
@@ -93,7 +110,7 @@ def load_text_encoder(text_encoder, path: Path) -> None:
 
 def convert(transformer) -> None:
     for block in transformer.transformer_blocks:
-        for path in PROJECTIONS:
+        for path in selected():
             *parents, name = path.split(".")
             module = block
             for part in parents:
@@ -112,7 +129,7 @@ def _read(path: Path) -> dict[str, mx.array]:
     return mx.load(str(path))
 
 
-def load(transformer, path: Path) -> None:
+def load(transformer, path: Path, float_dir: Path | None = None) -> None:
     from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
 
     weights = _read(path)
@@ -136,8 +153,19 @@ def load(transformer, path: Path) -> None:
         for part, half in zip(parts, halves):
             params[f"{block}{part}.{name}"] = half
     params = Qwen21Initializer._normalize_transformer_weights(params)
+    floats = [p for p in PROJECTIONS if p not in selected()]
+    if floats:
+        if float_dir is None:
+            raise ValueError("MFLUX_QWEN21_W8A8_CLASSES needs the bfloat16 transformer/ for the other projections")
+        bf16 = Qwen21Initializer._normalize_transformer_weights(_read(float_dir))
+        for key in list(params):
+            if any(f".{p}." in key for p in floats):
+                del params[key]
+        for key, value in bf16.items():
+            if any(f".{p}." in key for p in floats):
+                params[key] = value
     quantized = sum(1 for k, v in params.items() if v.dtype == mx.int8)
-    expected = len(transformer.transformer_blocks) * len(PROJECTIONS)
+    expected = len(transformer.transformer_blocks) * len(selected())
     if quantized != expected:
         raise ValueError(f"{path}: {quantized} int8 projections, expected {expected}")
     transformer.update(tree_unflatten(list(params.items())), strict=False)
