@@ -15,6 +15,7 @@ from mflux.models.common.compute_precision import ComputePrecision
 from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
 from mflux.models.common.weights.loading import zero_copy
+from mflux.models.qwen21.model.qwen21_transformer import qwen21_fusion
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_attention import Qwen21Attention
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_feed_forward import Qwen21SwiGLUFeedForward
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
@@ -257,7 +258,8 @@ class Qwen21Transformer(nn.Module):
             if len(cache) != len(self.transformer_blocks):
                 raise ValueError("Incomplete Qwen-Image-2.1 prefix cache.")
             x = self.img_in(hidden_states[:, -layout.target_tokens :])
-            target_mask = target_mask[layout.prefix_length :]
+            # the prefix is cached, so only target tokens remain: select_rows(None) broadcasts one row
+            target_mask = None if qwen21_fusion.enabled("select") else target_mask[layout.prefix_length :]
             rope = tuple(v[layout.prefix_length :] for v in rope)
         else:
             images = self.img_in(hidden_states)
