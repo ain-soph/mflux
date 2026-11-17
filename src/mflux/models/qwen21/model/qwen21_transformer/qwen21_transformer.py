@@ -178,6 +178,9 @@ class Qwen21Transformer(nn.Module):
     @staticmethod
     def _pack_linears(layers: tuple[nn.Module, ...]) -> mx.array | None:
         # Wrappers, adapters and quantized layers must keep their own forward path.
+        # Streamed zero-copy blocks hold no weights between steps, so there is nothing to pack.
+        if zero_copy.streaming():
+            return None
         if any(type(layer) is not nn.Linear or "bias" in layer for layer in layers):
             return None
         weights = [layer.weight for layer in layers]
@@ -301,19 +304,20 @@ class Qwen21Transformer(nn.Module):
         modulation = self.modulation(time)
         signal = None
         for index, block in enumerate(self.transformer_blocks):
-            x, stored = block.forward_reference(
-                x,
-                modulation,
-                target_mask,
-                layout,
-                rope,
-                cached=cache[index] if cached else None,
-                extract=cache is not None and not cached,
-                key_valid=key_valid,
-            )
-            if stored is not None:
-                cache.append(stored)
-            mx.eval(x)
+            with zero_copy.streamed(block):
+                x, stored = block.forward_reference(
+                    x,
+                    modulation,
+                    target_mask,
+                    layout,
+                    rope,
+                    cached=cache[index] if cached else None,
+                    extract=cache is not None and not cached,
+                    key_valid=key_valid,
+                )
+                if stored is not None:
+                    cache.append(stored)
+                mx.eval(x, stored)
             if step_cache is not None and index == 0:
                 signal = x[:, -layout.target_tokens :]
                 # only a cached pass can skip: the extract pass must fill every layer's cache
