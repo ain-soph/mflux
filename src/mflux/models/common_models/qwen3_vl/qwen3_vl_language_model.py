@@ -4,6 +4,7 @@ from collections.abc import Iterator
 import mlx.core as mx
 from mlx import nn
 
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common_models.qwen3_vl.qwen3_vl_decoder_layer import Qwen3VLDecoderLayer
 from mflux.models.common_models.qwen3_vl.qwen3_vl_rms_norm import Qwen3VLRMSNorm
 from mflux.models.common_models.qwen3_vl.qwen3_vl_rope import Qwen3VLRotaryEmbedding
@@ -84,7 +85,10 @@ class Qwen3VLLanguageModel(nn.Module):
             idx = mx.arange(hidden.shape[1])
             attention_mask = (idx[:, None] >= idx[None, :])[None, None]
         for index, layer in enumerate(self.layers):
-            hidden, _ = layer(hidden, attention_mask=attention_mask, position_embeddings=rope)
-            if deepstack is not None and index < len(deepstack):
-                hidden[:, image_indices] += deepstack[index].astype(hidden.dtype)[None]
-            yield hidden
+            with zero_copy.streamed(layer):
+                hidden, _ = layer(hidden, attention_mask=attention_mask, position_embeddings=rope)
+                if deepstack is not None and index < len(deepstack):
+                    hidden[:, image_indices] += deepstack[index].astype(hidden.dtype)[None]
+                if zero_copy.streaming():
+                    mx.eval(hidden)
+                yield hidden

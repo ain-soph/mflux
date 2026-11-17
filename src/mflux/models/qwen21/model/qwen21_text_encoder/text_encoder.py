@@ -4,6 +4,7 @@ import mlx.core as mx
 import numpy as np
 from mlx import nn
 
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common_models.qwen3_vl.qwen3_vl_language_model import Qwen3VLLanguageModel
 from mflux.models.common_models.qwen3_vl.qwen3_vl_multimodal import Qwen3VLMultimodal
 from mflux.models.common_models.qwen3_vl.qwen3_vl_vision_model import Qwen3VLVisionModel
@@ -70,6 +71,8 @@ class QwenImage21TextEncoder(nn.Module):
         mask = (idx[:, None] >= idx[None, :])[None, None]
         total = hidden.shape[1] + max_new_tokens
         caches = []
+        if zero_copy.streaming():
+            raise RuntimeError("Greedy decoding (enhance_prompt, auto_mask, verify) is not supported with MFLUX_ZERO_COPY_STREAM=1.")
         for index, layer in enumerate(model.layers):
             hidden, cache = layer(hidden, attention_mask=mask, position_embeddings=rope, max_cache_length=total)
             if deepstack is not None and index < len(deepstack):
