@@ -63,7 +63,7 @@ class Decoder(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.mid_block(VAEOperations.conv(self.conv_in, x, self.text_mode))
-        rows, first = Decoder.strip_rows(), Decoder.strip_from()
+        rows, first = Decoder.strip_rows(x.shape[2] * 2 ** Decoder.strip_from()), Decoder.strip_from()
         if self.text_mode or not rows:
             return self._upsample(x)
         # Row strips: after the mid block (the decoder's only global op) every layer is a 3x3 convolution, a
@@ -109,9 +109,18 @@ class Decoder(nn.Module):
     HALO = (16, 16, 16, 12, 8)
 
     @staticmethod
-    def strip_rows() -> int:
-        # Rows per strip, counted at the input of the first stripped block (MFLUX_QWEN21_VAE_STRIP_ROWS;
-        # 0 = whole image at once, the upstream behaviour).
+    def strip_rows(width: int) -> int:
+        # Rows per strip, counted at the input of the first stripped block (whose width is `width`).
+        # MFLUX_QWEN21_VAE_STRIP_ROWS fixes it (0 = whole image at once, the upstream behaviour);
+        # MFLUX_QWEN21_VAE_STRIP_BUDGET picks it per image: the largest power of two from 16 to 64 with
+        # rows * width <= budget, so a strip's memory stays about constant while narrow images get fewer,
+        # faster strips (budget 16384 at block 2: 64 rows at 1024 px wide, 32 at 2048, 16 at 2400-2752).
+        budget = int(os.environ.get("MFLUX_QWEN21_VAE_STRIP_BUDGET", "0"))
+        if budget:
+            rows = 64
+            while rows > 16 and rows * width > budget:
+                rows //= 2
+            return rows
         return int(os.environ.get("MFLUX_QWEN21_VAE_STRIP_ROWS", "0"))
 
     @staticmethod
@@ -171,6 +180,19 @@ class QwenImage21VAE(Qwen21VAECore):
         return latent.transpose(0, 3, 1, 2)[:, :, None]
 
     def decode(self, latents: mx.array) -> mx.array:
+        # MFLUX_QWEN21_VAE_CACHE_MB: MLX buffer-cache limit while decoding. The float32 strips are short-lived and
+        # every size differs, so a large cache only holds memory; the denoiser before it gains from a larger one.
+        limit = os.environ.get("MFLUX_QWEN21_VAE_CACHE_MB")
+        if limit is None:
+            return self._decode(latents)
+        previous = mx.set_cache_limit(int(float(limit) * 2**20))
+        mx.clear_cache()
+        try:
+            return self._decode(latents)
+        finally:
+            mx.set_cache_limit(previous)
+
+    def _decode(self, latents: mx.array) -> mx.array:
         latents = self._to_nhwc(latents)
         latents = latents * mx.array(self._std, dtype=latents.dtype) + mx.array(self._mean, dtype=latents.dtype)
         image = self.decoder(self.post_quant_conv(latents))
