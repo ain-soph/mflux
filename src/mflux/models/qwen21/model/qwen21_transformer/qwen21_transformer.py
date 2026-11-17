@@ -14,6 +14,7 @@ from mlx import nn
 from mflux.models.common.compute_precision import ComputePrecision
 from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_attention import Qwen21Attention
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_feed_forward import Qwen21SwiGLUFeedForward
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
@@ -185,11 +186,14 @@ class Qwen21Transformer(nn.Module):
             weight.shape != first.shape or weight.dtype != first.dtype for weight in weights[1:]
         ):
             return None
-        packed = mx.concatenate(weights, axis=0)
+        # Zero-copy weights stored back to back (zero_copy.align) pack as one more view of the file.
+        packed = zero_copy.adjacent_view(weights)
+        if packed is None:
+            packed = mx.concatenate(weights, axis=0)
         # Evaluate only this group, then release its source allocations. The original
         # checkpoint paths become views into the packed buffer, not duplicate weights.
         mx.eval(packed)
-        for layer, weight in zip(layers, mx.split(packed, len(layers), axis=0)):
+        for layer, weight in zip(layers, zero_copy.split_rows(packed, len(layers))):
             layer.weight = weight
         return packed
 
