@@ -10,6 +10,12 @@ Projection packing (QKV, gate/up) normally concatenates the weights into a new b
 `align` writes the tensors of each packing group next to each other with no padding, so `adjacent_view` can
 return the packed weight as one more view of the mapping instead of a copy.
 
+With MFLUX_ZERO_COPY_STREAM=1 as well, the layers wrapped in `streamed(layer)` (the Qwen-Image-2.1 DiT blocks and
+the Qwen3-VL text-encoder layers) hold their weights only while they run: the views are created on entry and
+dropped on exit. MLX makes every live buffer resident (wired) while the GPU works, so otherwise a generation
+wires all weights at once; streamed, it wires about one layer plus the activations. Projection packing is
+skipped in this mode (measured equally fast without it).
+
 Usage: python -m mflux.models.common.weights.loading.zero_copy DIR [DIR...]
   Replaces the *.safetensors in each component directory by one page-aligned model file (verified byte for
   byte before the originals are deleted). The result is an ordinary safetensors checkpoint.
@@ -17,6 +23,7 @@ Usage: python -m mflux.models.common.weights.loading.zero_copy DIR [DIR...]
 
 import json
 import mmap
+from contextlib import contextmanager
 import os
 import re
 import struct
@@ -57,6 +64,10 @@ def enabled() -> bool:
     return os.environ.get("MFLUX_ZERO_COPY") == "1"
 
 
+def streaming() -> bool:
+    return enabled() and os.environ.get("MFLUX_ZERO_COPY_STREAM") == "1"
+
+
 def read_header(path: Path) -> tuple[dict, int]:
     with open(path, "rb") as f:
         (length,) = struct.unpack("<Q", f.read(8))
@@ -64,9 +75,14 @@ def read_header(path: Path) -> tuple[dict, int]:
 
 
 def page_aligned(path: Path) -> bool:
+    """Written by `align`: the data starts on a page and every tensor whose size is a whole number of pages
+    starts on a page (the small rest, norms and biases, follows them and is copied when loaded)."""
     header, start = read_header(path)
+    specs = [spec for key, spec in header.items() if key != "__metadata__"]
     return start % PAGE == 0 and all(
-        (start + spec["data_offsets"][0]) % PAGE == 0 for key, spec in header.items() if key != "__metadata__"
+        (start + s["data_offsets"][0]) % PAGE == 0
+        for s in specs
+        if (s["data_offsets"][1] - s["data_offsets"][0]) % PAGE == 0
     )
 
 
@@ -101,8 +117,48 @@ def load(path: Path) -> dict[str, mx.array]:
         if b == a:
             out[key] = mx.zeros(spec["shape"], DTYPES[spec["dtype"]])
             continue
+        if (start + a) % PAGE or (b - a) % PAGE:
+            raw = mx.array(np.frombuffer(mapping, np.uint8, b - a, start + a))
+            out[key] = raw.view(DTYPES[spec["dtype"]]).reshape(spec["shape"])
+            continue
         out[key] = _registered(mapping, start + a, b - a, DTYPES[spec["dtype"]], spec["shape"])
     return out
+
+
+# id(module) -> [(parameter path, mapping, offset, nbytes, dtype, shape)] of its zero-copy parameters
+_streamed: dict[int, list[tuple]] = {}
+
+
+def _placeholders(specs: list[tuple]) -> list[tuple[str, mx.array]]:
+    return [(path, mx.zeros((0,), dtype)) for path, _, _, _, dtype, _ in specs]
+
+
+@contextmanager
+def streamed(module):
+    """Give `module` its zero-copy weights for the duration of the block (streaming mode only).
+
+    The caller must evaluate everything it needs from the module inside the block, or the weights stay
+    alive (correct, but not released) until it does."""
+    if not streaming():
+        yield
+        return
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    specs = _streamed.get(id(module))
+    if specs is None:
+        specs = []
+        for path, array in tree_flatten(module.parameters()):
+            entry = _origin.get(id(array))
+            if entry is not None and entry[0] is array:
+                specs.append((path, entry[1], entry[2], entry[3], array.dtype, list(array.shape)))
+                _origin.pop(id(array))
+                _views.pop((id(entry[1]), entry[2], entry[3], array.dtype, tuple(array.shape)), None)
+        _streamed[id(module)] = specs
+    module.update(tree_unflatten([(p, _view(m, o, n, d, s)) for p, m, o, n, d, s in specs]), strict=False)
+    try:
+        yield
+    finally:
+        module.update(tree_unflatten(_placeholders(specs)), strict=False)
 
 
 def adjacent_view(weights: list[mx.array]) -> mx.array | None:
@@ -134,6 +190,12 @@ def split_rows(packed: mx.array, parts: int) -> list[mx.array]:
     return [_registered(mapping, offset + i * step, step, packed.dtype, [rows, *packed.shape[1:]]) for i in range(parts)]
 
 
+def _contiguous(path: Path) -> bool:
+    header, _ = read_header(path)
+    spans = sorted(s["data_offsets"] for k, s in header.items() if k != "__metadata__")
+    return spans[0][0] == 0 and all(a[1] == b[0] for a, b in zip(spans, spans[1:]))
+
+
 def _order(keys: list[str]) -> list[str]:
     """Natural order, with every packing group's members consecutive and in packing order."""
 
@@ -162,7 +224,7 @@ def align(component_dir: Path) -> Path:
     """Rewrite a component's safetensors as one page-aligned file; verify; delete the originals."""
     component_dir = Path(component_dir)
     shards = sorted(p for p in component_dir.glob("*.safetensors") if not p.name.startswith("._"))
-    if len(shards) == 1 and page_aligned(shards[0]):
+    if len(shards) == 1 and page_aligned(shards[0]) and _contiguous(shards[0]):
         print(f"{component_dir}: already page-aligned")
         return shards[0]
     sources = {}
@@ -176,13 +238,19 @@ def align(component_dir: Path) -> Path:
     # look for it when there is no index).
     name = "diffusion_pytorch_model.safetensors" if any("diffusion_pytorch_model" in s.name for s in shards) else "model.safetensors"
     target = component_dir / (name + ".aligning")
-    keys = _order(list(sources))
+    # Safetensors readers require the tensors back to back with no gaps, so alignment comes from the order:
+    # tensors that are whole pages first (each then starts on a page), the small rest at the end.
+    def size(key):
+        a, b = sources[key][2]["data_offsets"]
+        return b - a
+
+    ordered = _order(list(sources))
+    keys = [k for k in ordered if size(k) % PAGE == 0] + [k for k in ordered if size(k) % PAGE]
     header, offset = {}, 0
     for key in keys:
-        _, _, spec = sources[key]
-        nbytes = spec["data_offsets"][1] - spec["data_offsets"][0]
-        header[key] = {"dtype": spec["dtype"], "shape": spec["shape"], "data_offsets": [offset, offset + nbytes]}
-        offset += -(-nbytes // PAGE) * PAGE
+        spec = sources[key][2]
+        header[key] = {"dtype": spec["dtype"], "shape": spec["shape"], "data_offsets": [offset, offset + size(key)]}
+        offset += size(key)
     if metadata:
         header = {"__metadata__": metadata, **header}
     blob = json.dumps(header, separators=(",", ":")).encode()
