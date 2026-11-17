@@ -9,6 +9,7 @@ from mlx.core.fast import scaled_dot_product_attention
 
 from mflux.models.common.compute_precision import ComputePrecision
 from mflux.models.common.quantization.w8a8 import W8A8Linear
+from mflux.models.qwen21.model.qwen21_transformer import qwen21_fusion
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_fused_kernels import (
     fused_qk_norm_rope,
     fused_qk_norm_rope_available,
@@ -83,12 +84,18 @@ class Qwen21Attention(nn.Module):
         dtype = x.dtype
         x = self.compute_precision.to_compute(x)
         batch, length, dim = x.shape
-        q, k, v = [
-            projection.reshape(batch, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-            for projection in self._project_qkv(x)
-        ]
-        q = QwenImage21Layout.rotate(self.norm_q(q).astype(v.dtype), rope)
-        k = QwenImage21Layout.rotate(self.norm_k(k).astype(v.dtype), rope)
+        projections = self._project_qkv(x)
+        fused = None
+        if qwen21_fusion.enabled("qknorm") and self.norm_q.eps == self.norm_k.eps == 1e-6:
+            fused = fused_qk_norm_rope(projections[0], projections[1], self.norm_q.weight, self.norm_k.weight,
+                                       rope[0], rope[1], self.num_heads, self.head_dim)
+        v = projections[2].reshape(batch, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        if fused is not None:
+            q, k = (t.astype(v.dtype) for t in fused)
+        else:
+            q, k = (p.reshape(batch, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3) for p in projections[:2])
+            q = QwenImage21Layout.rotate(self.norm_q(q).astype(v.dtype), rope)
+            k = QwenImage21Layout.rotate(self.norm_k(k).astype(v.dtype), rope)
         stored = None
         if cached is not None:
             k, v = mx.concatenate([cached[0], k], axis=2), mx.concatenate([cached[1], v], axis=2)

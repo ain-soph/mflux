@@ -5,6 +5,7 @@ import mlx.core as mx
 from mlx import nn
 
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_attention import Qwen21Attention
+from mflux.models.qwen21.model.qwen21_transformer import qwen21_fusion
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_feed_forward import Qwen21SwiGLUFeedForward
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
 
@@ -109,10 +110,17 @@ class Qwen21TransformerBlock(nn.Module):
         attn, stored = self.attn.forward_reference(
             self.img_norm1(x) * (1 + scale1), layout, rope, cached, extract, key_valid
         )
+        if qwen21_fusion.enabled("residual"):
+            x = qwen21_fusion.gated_residual(x, gate1, attn)
+            x = qwen21_fusion.gated_residual(x, gate2, self.img_mlp(self.img_norm2(x) * (1 + scale2)))
+            return x, stored
         x = x + mx.tanh(gate1) * attn
         x = x + mx.tanh(gate2) * self.img_mlp(self.img_norm2(x) * (1 + scale2))
         return x, stored
 
     @staticmethod
-    def select_rows(value: mx.array, mask: mx.array) -> mx.array:
+    def select_rows(value: mx.array, mask: mx.array | None) -> mx.array:
+        # mask None: every token is a target token (the cached denoise pass), one broadcast row
+        if mask is None:
+            return value[:-1, None]
         return mx.where(mask[None, :, None], value[:-1, None], value[-1:, None])
