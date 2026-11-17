@@ -1,3 +1,13 @@
+> **ain-soph/mflux `serving` branch** — mflux v0.24.0 plus memory work for serving Qwen-Image-2.1 on Apple Silicon next to
+> other models (all opt-in, outputs unchanged):
+> - `python -m mflux.models.common.weights.loading.zero_copy DIR...` rewrites a component as one page-aligned, standard
+>   safetensors file; `MFLUX_ZERO_COPY=1` maps it read-only instead of copying it into MLX buffers.
+> - `MFLUX_ZERO_COPY_STREAM=1` gives each Qwen-Image-2.1 DiT block / Qwen3-VL text layer its weights only while it runs.
+>   MLX keeps every live buffer resident during GPU work, so this (with an MLX cache limit of ~2 GB) cuts the wired peak
+>   of a generation from 44-52 GB to ~12 GB at 1024x1024 on an M5 Ultra, same speed, byte-identical images.
+> - `MFLUX_QWEN21_VAE_STRIP_ROWS=N` decodes the Qwen-Image-2.1 VAE in row strips (exact up to float rounding):
+>   2048x2048 extra decode memory 35.5 GB -> ~1 GB at N=16.
+
 ![image](src/mflux/assets/logo.jpg)
 
 [![MFLUX](https://img.shields.io/pypi/v/mflux?label=MFLUX&logo=pypi&logoColor=white)](https://pypi.org/project/mflux/)
