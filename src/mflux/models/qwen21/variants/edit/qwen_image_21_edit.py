@@ -376,6 +376,20 @@ class QwenImage21Edit(nn.Module):
         # What the metadata records for a reference: its path, or a placeholder for an image passed in memory.
         return str(image) if isinstance(image, (str, Path)) else "<in-memory image>"
 
+    def rewrite_text_prompt(self, prompt: str) -> tuple[str, str | None]:
+        """Text-to-image counterpart of rewrite_prompt: (detailed English description, aspect ratio "W:H" or None),
+        from the in-memory Qwen3-VL following a condensation of the official t2i rewrite recipe. Raises when the
+        reply cannot be parsed."""
+        if self.small_text_encoder:
+            raise ValueError(QwenImage21Edit.SMALL_TEXT_ENCODER_VISION_ERROR)
+        if not prompt or not prompt.strip():
+            raise ValueError("There is no request to rewrite: the prompt is empty.")
+        reply = self._vision_reply(QwenImage21Grounding.REWRITE_T2I_PROMPT.format(request=prompt), [], 512)
+        parsed = QwenImage21Grounding.parse_t2i_rewrite(reply)
+        if parsed is None:
+            raise ValueError(f"The rewrite reply could not be parsed: {reply[:120]!r}")
+        return parsed
+
     def _rewrite_prompt(self, prompt: str, images: list[Image.Image]) -> str:
         # Official serving recipe: rewrite a terse instruction into a detailed description
         # before encoding. Best-effort: any failure falls back to the original instruction.
@@ -421,8 +435,8 @@ class QwenImage21Edit(nn.Module):
         inputs = self.processor(text=[text], images=feeds, return_tensors="np")
         ids = self.text_encoder.generate(
             mx.array(inputs["input_ids"]),
-            pixel_values=mx.array(inputs["pixel_values"]),
-            image_grid_thw=mx.array(inputs["image_grid_thw"]),
+            pixel_values=mx.array(inputs["pixel_values"]) if feeds else None,
+            image_grid_thw=mx.array(inputs["image_grid_thw"]) if feeds else None,
             max_new_tokens=max_new_tokens,
         )
         reply = self.processor.tokenizer.decode(ids)

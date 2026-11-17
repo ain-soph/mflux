@@ -6,8 +6,8 @@ text encoder and the VAE still come from the checkpoint. The non-block layers st
 The file can be page-aligned (zero_copy.align) to load it zero-copy and stream it like the bfloat16 weights.
 
 MFLUX_QWEN21_TE_W8A8=<file> does the same for the Qwen3-VL text encoder (Comfy-Org qwen3vl_8b_int8_convrot): the 36
-language layers' projections become W8A8Linear and the token embedding a ConvRotEmbedding; the vision tower stays
-bfloat16 as stored. The unused generation head (lm_head) is not loaded.
+language layers' projections and the generation head (lm_head) become W8A8Linear and the token embedding a
+ConvRotEmbedding; the vision tower stays bfloat16 as stored.
 """
 
 import json
@@ -48,6 +48,8 @@ def convert_text_encoder(text_encoder) -> None:
             W8A8Linear.replace(getattr(layer, parent), name)
     vocab, dims = model.embed_tokens.weight.shape
     model.embed_tokens = ConvRotEmbedding(vocab, dims)
+    # the generation head (enhance_prompt, auto_mask, verify) is int8 convrot too
+    W8A8Linear.replace(text_encoder, "lm_head")
 
 
 def _check_quant(weights: dict) -> None:
@@ -70,8 +72,8 @@ def load_text_encoder(text_encoder, path: Path) -> None:
     params = {}
     for key, value in weights.items():
         if key.startswith("lm_head."):
-            continue
-        if key.startswith("model.visual."):
+            target = key
+        elif key.startswith("model.visual."):
             target = "visual." + key[len("model.visual."):]
             value = Qwen3VLMultimodal.vision_weight(target, value)
         elif key.startswith("model."):
@@ -82,12 +84,11 @@ def load_text_encoder(text_encoder, path: Path) -> None:
             target, value = target[: -len(".weight_scale")] + ".scale", value.reshape(-1)
         params[target] = value
     # inv_freq buffers are computed by the modules, not stored
-    expected = {p for p, _ in tree_flatten(text_encoder.parameters()) if not p.startswith("lm_head.") and not p.endswith(".inv_freq")}
+    expected = {p for p, _ in tree_flatten(text_encoder.parameters()) if not p.endswith(".inv_freq")}
     missing, extra = expected - set(params), set(params) - expected
     if missing or extra:
         raise ValueError(f"{path}: missing {sorted(missing)[:5]} ({len(missing)}), unexpected {sorted(extra)[:5]} ({len(extra)})")
     text_encoder.update(tree_unflatten(list(params.items())), strict=False)
-    text_encoder.has_generation_head = False
 
 
 def convert(transformer) -> None:
