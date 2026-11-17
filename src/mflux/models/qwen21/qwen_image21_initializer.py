@@ -21,6 +21,7 @@ from mflux.models.qwen21.model.qwen21_transformer.qwen21_feed_forward import Qwe
 from mflux.models.qwen21.model.qwen21_transformer.qwen_image21_transformer import QwenImage21Transformer
 from mflux.models.qwen21.model.qwen21_vae.vae import QwenImage21VAE
 from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
+from mflux.models.qwen21.weights import qwen21_w8a8
 from mflux.models.qwen21.weights.qwen_image21_weight_definition import (
     QwenImage21NoTextEncoderWeightDefinition,
     QwenImage21WeightDefinition,
@@ -77,7 +78,37 @@ class QwenImage21Initializer:
         # (bfloat16 for Qwen-Image-2.1-Turbo, float32 for Qwen-Image-2.1).
         model._vae_stored_dtype = SafetensorsReader.stored_float_dtype(root / "vae")
         model.transformer = QwenImage21Transformer(model._component_configs["transformer"])
+        w8a8 = qwen21_w8a8.checkpoint()
+        if w8a8 is not None:
+            # The DiT comes from an int8_convrot file (MFLUX_QWEN21_W8A8), the rest from the checkpoint.
+            if quantize is not None:
+                raise ValueError("MFLUX_QWEN21_W8A8 already quantizes the transformer; do not pass quantize.")
+            qwen21_w8a8.convert(model.transformer)
+            base = definition
+
+            class definition(base):  # noqa: N801
+                @staticmethod
+                def get_components():
+                    return [c for c in base.get_components() if c.name != "transformer"]
+
+        te_w8a8 = qwen21_w8a8.text_checkpoint() if not small_text_encoder else None
+        if te_w8a8 is not None:
+            # The text encoder comes from an int8_convrot file (MFLUX_QWEN21_TE_W8A8).
+            if quantize is not None:
+                raise ValueError("MFLUX_QWEN21_TE_W8A8 already quantizes the text encoder; do not pass quantize.")
+            qwen21_w8a8.convert_text_encoder(model.text_encoder)
+            without_text = definition
+
+            class definition(without_text):  # noqa: N801
+                @staticmethod
+                def get_components():
+                    return [c for c in without_text.get_components() if c.name != "text_encoder"]
+
         Qwen21Initializer.load_components(model, root, definition, quantize, validate=True)
+        if w8a8 is not None:
+            qwen21_w8a8.load(model.transformer, w8a8)
+        if te_w8a8 is not None:
+            qwen21_w8a8.load_text_encoder(model.text_encoder, te_w8a8)
         Qwen21Initializer.apply_lora(model, lora_paths, lora_scales, bake_lora)
         model.compute_precision = precision
         if compute_precision is not None:

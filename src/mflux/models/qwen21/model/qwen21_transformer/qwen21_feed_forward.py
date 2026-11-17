@@ -2,6 +2,7 @@ import mlx.core as mx
 from mlx import nn
 
 from mflux.models.common.compute_precision import ComputePrecision
+from mflux.models.common.quantization.w8a8 import W8A8Linear
 
 
 class Qwen21SwiGLUFeedForward(nn.Module):
@@ -16,7 +17,9 @@ class Qwen21SwiGLUFeedForward(nn.Module):
     def __call__(self, hidden_states: mx.array) -> mx.array:
         dtype = hidden_states.dtype
         hidden_states = self.compute_precision.to_compute(hidden_states)
-        if self._gate_proj_weight is None:
+        if isinstance(self.gate_layer, W8A8Linear) and isinstance(self.proj, W8A8Linear):
+            gate, proj = W8A8Linear.fused(hidden_states, (self.gate_layer, self.proj))
+        elif self._gate_proj_weight is None:
             gate, proj = self.gate_layer(hidden_states), self.proj(hidden_states)
         else:
             gate, proj = mx.split(hidden_states @ self._gate_proj_weight.T, 2, axis=-1)

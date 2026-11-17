@@ -8,6 +8,7 @@ from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
 
 from mflux.models.common.compute_precision import ComputePrecision
+from mflux.models.common.quantization.w8a8 import W8A8Linear
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_fused_kernels import (
     fused_qk_norm_rope,
     fused_qk_norm_rope_available,
@@ -194,6 +195,8 @@ class Qwen21Attention(nn.Module):
         return self.compute_precision.to_stream(self._unproject(hidden_states), dtype)
 
     def _project_qkv(self, hidden_states: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        if isinstance(self.to_q, W8A8Linear) and isinstance(self.to_k, W8A8Linear) and isinstance(self.to_v, W8A8Linear):
+            return tuple(W8A8Linear.fused(hidden_states, (self.to_q, self.to_k, self.to_v)))
         if self._qkv_weight is not None:
             query, key, value = mx.split(hidden_states @ self._qkv_weight.T, 3, axis=-1)
             return query, key, value
