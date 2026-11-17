@@ -63,33 +63,64 @@ class Decoder(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.mid_block(VAEOperations.conv(self.conv_in, x, self.text_mode))
-        rows = Decoder.strip_rows()
-        if self.text_mode or not rows or x.shape[1] <= rows + 2 * Decoder.HALO:
+        rows, first = Decoder.strip_rows(), Decoder.strip_from()
+        if self.text_mode or not rows:
             return self._upsample(x)
-        # Row strips: after the mid block (the only global op) every layer is a 3x3 convolution, a nearest
-        # upsample or a per-pixel channel norm, so each output row depends on ~12.3 latent rows around it.
-        # Decoding strips of `rows` latent rows with HALO rows of context on each side gives the same pixels
-        # and bounds the full-resolution float32 activations to one strip.
+        # Row strips: after the mid block (the decoder's only global op) every layer is a 3x3 convolution, a
+        # nearest upsample or a per-pixel channel norm, so an output row only depends on the rows around it.
+        # Two passes: the first `first` up blocks (low resolution, many channels) in strips of latent rows,
+        # giving their whole-image output; then the rest in strips of `rows` rows of that output. Each pass
+        # adds context rows covering the measured reach of the blocks it runs, so the pixels are the same up
+        # to float rounding, and only one strip of each pass is held at a time.
+        if first:
+            x = Decoder._in_strips(x, lambda v: self._blocks(v, 0, first), Decoder.LOW_ROWS, Decoder.LOW_HALO[first],
+                                   2 ** sum(b.upsampler is not None for b in self.up_blocks[:first]))
+        return Decoder._in_strips(x, lambda v: self._upsample(v, first), rows, Decoder.HALO[first],
+                                  2 ** sum(b.upsampler is not None for b in self.up_blocks[first:]))
+
+    @staticmethod
+    def _in_strips(x: mx.array, fn, rows: int, halo: int, scale: int) -> mx.array:
         mx.eval(x)
-        height, scale = x.shape[1], 2 ** sum(block.upsampler is not None for block in self.up_blocks)
+        height = x.shape[1]
+        if height <= rows + 2 * halo:
+            return fn(x)
         strips = []
         for top in range(0, height, rows):
             bottom = min(height, top + rows)
-            a, b = max(0, top - Decoder.HALO), min(height, bottom + Decoder.HALO)
-            strip = self._upsample(x[:, a:b])[:, (top - a) * scale : (bottom - a) * scale]
+            a, b = max(0, top - halo), min(height, bottom + halo)
+            strip = fn(x[:, a:b])[:, (top - a) * scale : (bottom - a) * scale]
             mx.eval(strip)
             strips.append(strip)
         return mx.concatenate(strips, axis=1)
 
-    HALO = 16  # latent rows; the receptive field of the upsampling stack is ~12.3
+    def _blocks(self, x: mx.array, start: int, stop: int) -> mx.array:
+        for block in self.up_blocks[start:stop]:
+            x = block(x)
+            mx.eval(x)
+        return x
+
+    # Latent rows per strip of the first pass, and its context: measured reach of up_blocks[:k] in latent
+    # rows (bench halo probe): k=1 7.0, k=2 10.5, k=3 12.3.
+    LOW_ROWS = 16
+    LOW_HALO = (0, 8, 12, 14, 16)
+
+    # Rows of context for strips that start at up block k. Measured reach of up_blocks[k:] + head in rows of
+    # block k's input (bench halo probe, Qwen-Image-2.1 VAE): 13.6, 13.1, 12.3, 10.5, 7.0.
+    HALO = (16, 16, 16, 12, 8)
 
     @staticmethod
     def strip_rows() -> int:
-        # Latent rows per strip (MFLUX_QWEN21_VAE_STRIP_ROWS; 0 = whole image at once, the upstream behaviour).
+        # Rows per strip, counted at the input of the first stripped block (MFLUX_QWEN21_VAE_STRIP_ROWS;
+        # 0 = whole image at once, the upstream behaviour).
         return int(os.environ.get("MFLUX_QWEN21_VAE_STRIP_ROWS", "0"))
 
-    def _upsample(self, x: mx.array) -> mx.array:
-        for block in self.up_blocks:
+    @staticmethod
+    def strip_from() -> int:
+        # Up blocks that run on the whole image before the strips start (MFLUX_QWEN21_VAE_STRIP_FROM, 0-4).
+        return int(os.environ.get("MFLUX_QWEN21_VAE_STRIP_FROM", "0"))
+
+    def _upsample(self, x: mx.array, first: int = 0) -> mx.array:
+        for block in self.up_blocks[first:]:
             x = block(x)
             if not self.text_mode:
                 mx.eval(x)
