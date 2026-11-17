@@ -10,6 +10,7 @@ from mlx.utils import tree_unflatten
 
 from mflux.cli.defaults.defaults import MFLUX_CACHE_DIR
 from mflux.models.common.resolution.path_resolution import PathResolution
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common.weights.loading.loaded_weights import LoadedWeights, MetaData
 from mflux.models.common.weights.loading.safetensors_reader import SafetensorsReader
 from mflux.models.common.weights.loading.weight_definition import ComponentDefinition
@@ -374,7 +375,10 @@ class WeightLoader:
 
         all_weights: dict[str, mx.array] = {}
         for shard in shard_files:
-            weights = mx.load(str(shard))
+            if zero_copy.enabled() and zero_copy.page_aligned(shard):
+                weights = zero_copy.load(shard)
+            else:
+                weights = mx.load(str(shard))
             all_weights.update(weights)
 
         return all_weights
