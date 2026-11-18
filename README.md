@@ -7,6 +7,7 @@
 > | Qwen-Image-2.1 VAE in two-pass row strips, own MLX cache cap | full-frame FP32 decode needs 10–55 GB extra | `MFLUX_QWEN21_VAE_STRIP_FROM=2`, `_STRIP_BUDGET`, `_STRIP_ROWS`, `MFLUX_QWEN21_VAE_CACHE_MB` (off) | 2752×1536 wired 21.5 → 8.9 GB; max diff 3/255 |
 > | W8A8 DiT from ComfyUI `int8_convrot` | INT8 TensorOps GEMM on M5 | `MFLUX_QWEN21_W8A8=<file>` (off) | denoise Turbo 1024² 7.48 → 5.03 s, base 40.1 → 23.7 s; velocity error 3.0 → 3.5 % |
 > | Rotate-quantize as one Metal kernel | the FP32 Hadamard matmul took 40–70 % of the GEMM | with W8A8 (always) | 16384×12288: 7.2 → 2.2 ms |
+> | Qwen-Image-2.1 VAE decoder in BF16 | the official Turbo VAE is BF16; the FP32 decode takes ~2.4 s of a ~6.5 s Turbo 1024² image | `MFLUX_QWEN21_VAE_DTYPE=bfloat16` (off: float32) | decode 1024² 2.4 → 1.5 s, 2048² 11.2 → 6.8 s; peak −3.8 / −5.5 GB; PSNR 43–53 dB vs FP32 |
 > | W8A16 text encoder (8-bit weights, BF16 activations) | smaller file, error close to BF16 | `MFLUX_QWEN21_TE_Q8=<dir>`, converter `qwen21_q8` (off) | 16.4 → 10.9 GB; embeds error 2.58 → 3.55 %; encode 0.22 → 0.17 s |
 > | W8A8 text encoder (`int8_convrot`) | less page cache | `MFLUX_QWEN21_TE_W8A8=<file>` (off) | −8.8 GB page cache; embeds error 6.2 %, no speedup (not used by us) |
 > | Fused element-wise ops in cached denoise blocks | ~19 ms per block outside GEMM and attention | `QWEN21_FUSION` (default all on; empty = off) | per block 1024² 20.0 → 17.7 ms, 2048² 121.0 → 108.0 ms; byte-identical |

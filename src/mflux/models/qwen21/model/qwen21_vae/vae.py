@@ -2,6 +2,7 @@ import os
 
 import mlx.core as mx
 from mlx import nn
+from mlx.utils import tree_map
 
 from mflux.models.qwen21.model.qwen21_vae.blocks import ChannelNorm, DownBlock, MidBlock, UpBlock, VAEOperations
 from mflux.models.qwen21.model.qwen21_vae.qwen21_vae_config import Qwen21VAEConfig
@@ -195,8 +196,29 @@ class QwenImage21VAE(Qwen21VAECore):
     def _decode(self, latents: mx.array) -> mx.array:
         latents = self._to_nhwc(latents)
         latents = latents * mx.array(self._std, dtype=latents.dtype) + mx.array(self._mean, dtype=latents.dtype)
+        dtype = self._decode_dtype()
+        if dtype is not None:
+            # MFLUX_QWEN21_VAE_DTYPE=bfloat16: run the decoder in bfloat16 (as the official Turbo VAE). On an M5 Ultra
+            # 1024² decodes 2.4 -> 1.5 s and 2048² 11.2 -> 6.8 s with 3.8 / 5.5 GB less peak memory, PSNR 43-53 dB
+            # against float32; the encoder (editing) stays in its stored dtype.
+            self._cast_decoder(dtype)
+            latents = latents.astype(dtype)
         image = self.decoder(self.post_quant_conv(latents))
-        return mx.clip(image, -1, 1).transpose(0, 3, 1, 2)[:, :, None]
+        image = mx.clip(image, -1, 1).transpose(0, 3, 1, 2)[:, :, None]
+        return image.astype(mx.float32) if dtype is not None else image
+
+    @staticmethod
+    def _decode_dtype() -> mx.Dtype | None:
+        name = os.environ.get("MFLUX_QWEN21_VAE_DTYPE")
+        return None if not name or name == "float32" else getattr(mx, name)
+
+    def _cast_decoder(self, dtype: mx.Dtype) -> None:
+        if self.post_quant_conv.weight.dtype == dtype:
+            return
+        cast = lambda x: x.astype(dtype) if mx.issubdtype(x.dtype, mx.floating) else x  # noqa: E731
+        for module in (self.decoder, self.post_quant_conv):
+            module.update(tree_map(cast, module.parameters()))
+        mx.eval(self.decoder.parameters(), self.post_quant_conv.parameters())
 
     @staticmethod
     def _to_nhwc(value: mx.array) -> mx.array:
