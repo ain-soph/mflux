@@ -2,7 +2,7 @@
 >
 > | Change | Why | Enable / default | Effect (M5 Ultra) |
 > |---|---|---|---|
-> | Zero-copy page-aligned weights | map weights from the page cache instead of copying them | `MFLUX_ZERO_COPY=1` after `python -m mflux.models.common.weights.loading.zero_copy DIR` (off) | process RSS 33.8 → 2.0 GB; byte-identical |
+> | Zero-copy page-aligned weights | map weights from the page cache instead of copying them | `MFLUX_ZERO_COPY=1` after `python -m mflux.models.common.weights.loading.zero_copy DIR` (off) | process RSS 33.8 → 2.0 GB; byte-identical. Needs the [ain-soph/mlx](https://github.com/ain-soph/mlx/tree/serving) fork (`mx.SafetensorsFile`) |
 > | Per-layer weight streaming (Qwen-Image-2.1 DiT, Qwen3-VL) | MLX wires every live buffer while the GPU runs | `MFLUX_ZERO_COPY_STREAM=1` (off) | generation wired peak 44–52 → <10 GB; same speed; byte-identical |
 > | Qwen-Image-2.1 VAE in two-pass row strips, own MLX cache cap | full-frame FP32 decode needs 10–55 GB extra | `MFLUX_QWEN21_VAE_STRIP_FROM=2`, `_STRIP_BUDGET`, `_STRIP_ROWS`, `MFLUX_QWEN21_VAE_CACHE_MB` (off) | 2752×1536 wired 21.5 → 8.9 GB; max diff 3/255 |
 > | W8A8 DiT from ComfyUI `int8_convrot` | INT8 TensorOps GEMM on M5 | `MFLUX_QWEN21_W8A8=<file>` (off) | denoise Turbo 1024² 7.48 → 5.03 s, base 40.1 → 23.7 s; velocity error 3.0 → 3.5 % |
