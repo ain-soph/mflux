@@ -1,12 +1,20 @@
-> **ain-soph/mflux `serving` branch** — mflux v0.24.0 plus memory work for serving Qwen-Image-2.1 on Apple Silicon next to
-> other models (all opt-in, outputs unchanged):
-> - `python -m mflux.models.common.weights.loading.zero_copy DIR...` rewrites a component as one page-aligned, standard
->   safetensors file; `MFLUX_ZERO_COPY=1` maps it read-only instead of copying it into MLX buffers.
-> - `MFLUX_ZERO_COPY_STREAM=1` gives each Qwen-Image-2.1 DiT block / Qwen3-VL text layer its weights only while it runs.
->   MLX keeps every live buffer resident during GPU work, so this (with an MLX cache limit of ~2 GB) cuts the wired peak
->   of a generation from 44-52 GB to ~12 GB at 1024x1024 on an M5 Ultra, same speed, byte-identical images.
-> - `MFLUX_QWEN21_VAE_STRIP_ROWS=N` (+ `MFLUX_QWEN21_VAE_STRIP_FROM=2`) decodes the Qwen-Image-2.1 VAE in row strips,
->   two passes (exact up to float rounding): wired peak of a 2752x1536 Turbo generation 21.5 -> 8.9 GB.
+> **ain-soph fork (`serving` branch, based on upstream v0.24.0).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Zero-copy page-aligned weights | map weights from the page cache instead of copying them | `MFLUX_ZERO_COPY=1` after `python -m mflux.models.common.weights.loading.zero_copy DIR` (off) | process RSS 33.8 → 2.0 GB; byte-identical |
+> | Per-layer weight streaming (Qwen-Image-2.1 DiT, Qwen3-VL) | MLX wires every live buffer while the GPU runs | `MFLUX_ZERO_COPY_STREAM=1` (off) | generation wired peak 44–52 → <10 GB; same speed; byte-identical |
+> | Qwen-Image-2.1 VAE in two-pass row strips, own MLX cache cap | full-frame FP32 decode needs 10–55 GB extra | `MFLUX_QWEN21_VAE_STRIP_FROM=2`, `_STRIP_BUDGET`, `_STRIP_ROWS`, `MFLUX_QWEN21_VAE_CACHE_MB` (off) | 2752×1536 wired 21.5 → 8.9 GB; max diff 3/255 |
+> | W8A8 DiT from ComfyUI `int8_convrot` | INT8 TensorOps GEMM on M5 | `MFLUX_QWEN21_W8A8=<file>` (off) | denoise Turbo 1024² 7.48 → 5.03 s, base 40.1 → 23.7 s; velocity error 3.0 → 3.5 % |
+> | Rotate-quantize as one Metal kernel | the FP32 Hadamard matmul took 40–70 % of the GEMM | with W8A8 (always) | 16384×12288: 7.2 → 2.2 ms |
+> | W8A16 text encoder (8-bit weights, BF16 activations) | smaller file, error close to BF16 | `MFLUX_QWEN21_TE_Q8=<dir>`, converter `qwen21_q8` (off) | 16.4 → 10.9 GB; embeds error 2.58 → 3.55 %; encode 0.22 → 0.17 s |
+> | W8A8 text encoder (`int8_convrot`) | less page cache | `MFLUX_QWEN21_TE_W8A8=<file>` (off) | −8.8 GB page cache; embeds error 6.2 %, no speedup (not used by us) |
+> | Fused element-wise ops in cached denoise blocks | ~19 ms per block outside GEMM and attention | `QWEN21_FUSION` (default all on; empty = off) | per block 1024² 20.0 → 17.7 ms, 2048² 121.0 → 108.0 ms; byte-identical |
+> | Prompt rewrite for text-to-image (text encoder generates with streamed weights) | `--enhance-prompt` only rewrote edits | `--enhance-prompt` (off) | judge win rate 75 % vs no rewrite (32 prompts) |
+> | W8A8 GEMM edge tiles stay inside their tensors | out-of-bounds reads on the last tile | always | byte-identical |
+> | No upper version bounds on runtime dependencies | one shared environment with other engines | — | — |
+>
+> Full numbers: [Qwen-Image-2.1 in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#图片qwen-image-21). Upstream PRs: [#998](https://github.com/mflux-community/mflux/pull/998), [#999](https://github.com/mflux-community/mflux/pull/999), [#1000](https://github.com/mflux-community/mflux/pull/1000) (all open).
 
 ![image](src/mflux/assets/logo.jpg)
 
