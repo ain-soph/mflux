@@ -21,7 +21,7 @@ from mflux.models.qwen21.model.qwen21_transformer.qwen21_feed_forward import Qwe
 from mflux.models.qwen21.model.qwen21_transformer.qwen_image21_transformer import QwenImage21Transformer
 from mflux.models.qwen21.model.qwen21_vae.vae import QwenImage21VAE
 from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
-from mflux.models.qwen21.weights import qwen21_w8a8
+from mflux.models.qwen21.weights import qwen21_q8, qwen21_w8a8
 from mflux.models.qwen21.weights.qwen_image21_weight_definition import (
     QwenImage21NoTextEncoderWeightDefinition,
     QwenImage21WeightDefinition,
@@ -92,6 +92,21 @@ class QwenImage21Initializer:
                     return [c for c in base.get_components() if c.name != "transformer"]
 
         te_w8a8 = qwen21_w8a8.text_checkpoint() if not small_text_encoder else None
+        te_q8 = qwen21_q8.checkpoint() if not small_text_encoder else None
+        if te_w8a8 is not None and te_q8 is not None:
+            raise ValueError("Set only one of MFLUX_QWEN21_TE_W8A8 and MFLUX_QWEN21_TE_Q8.")
+        if te_q8 is not None:
+            # The text encoder comes from an 8-bit-weight file (MFLUX_QWEN21_TE_Q8, bfloat16 activations).
+            if quantize is not None:
+                raise ValueError("MFLUX_QWEN21_TE_Q8 already quantizes the text encoder; do not pass quantize.")
+            qwen21_q8.convert_text_encoder(model.text_encoder)
+            without_text_q8 = definition
+
+            class definition(without_text_q8):  # noqa: N801
+                @staticmethod
+                def get_components():
+                    return [c for c in without_text_q8.get_components() if c.name != "text_encoder"]
+
         if te_w8a8 is not None:
             # The text encoder comes from an int8_convrot file (MFLUX_QWEN21_TE_W8A8).
             if quantize is not None:
@@ -109,6 +124,8 @@ class QwenImage21Initializer:
             qwen21_w8a8.load(model.transformer, w8a8)
         if te_w8a8 is not None:
             qwen21_w8a8.load_text_encoder(model.text_encoder, te_w8a8)
+        if te_q8 is not None:
+            qwen21_q8.load_text_encoder(model.text_encoder, te_q8)
         Qwen21Initializer.apply_lora(model, lora_paths, lora_scales, bake_lora)
         model.compute_precision = precision
         if compute_precision is not None:
