@@ -1,7 +1,8 @@
 """Zero-copy weights: page-aligned safetensors mapped read-only and wrapped as MLX arrays without a copy.
 
 With MFLUX_ZERO_COPY=1, a safetensors file whose tensors all start on a page boundary (see `align`) is not
-read into MLX buffers. Each tensor becomes an MLX array over a read-only mmap of the file, so the GPU reads the
+read into MLX buffers. Each tensor becomes an MLX array over a read-only mapping of the file (MLX's
+SafetensorsFile, ain-soph/mlx `serving`), so the GPU reads the
 weights straight from the page cache: an idle process holds no wired memory for them, the kernel may drop the
 pages under memory pressure (they are re-read from disk on the next use), and several processes that map the
 same file share one copy.
@@ -22,7 +23,6 @@ Usage: python -m mflux.models.common.weights.loading.zero_copy DIR [DIR...]
 """
 
 import json
-import mmap
 from contextlib import contextmanager
 import os
 import re
@@ -31,33 +31,25 @@ import sys
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 
 PAGE = os.sysconf("SC_PAGE_SIZE")
-DTYPES = {
-    "BF16": mx.bfloat16,
-    "F16": mx.float16,
-    "F32": mx.float32,
-    "F64": mx.float64,
-    "I8": mx.int8,
-    "U8": mx.uint8,
-    "I16": mx.int16,
-    "I32": mx.int32,
-    "I64": mx.int64,
-    "U32": mx.uint32,
-    "BOOL": mx.bool_,
-}
 # Tensors that projection packing concatenates, in packing order; align keeps each group contiguous.
 PACK_GROUPS = (
     (".attn.to_q.weight", ".attn.to_k.weight", ".attn.to_v.weight"),
     (".img_mlp.gate_layer.weight", ".img_mlp.proj.weight"),
 )
 
-# id(array) -> (array, mapping, absolute offset, nbytes) for every view handed out here
+# Where an array handed out here comes from: (file, keys, part). keys is one tensor name, or several that lie back
+# to back in the file and are packed row-wise (file.get_rows); part is (i, n) for the i-th of n row blocks of a
+# single tensor, else None.
+_Source = tuple
+# id(array) -> (array, source) for every view handed out here
 _origin: dict[int, tuple] = {}
-# One view per (mapping, range, dtype, shape): packing every generation reuses the same arrays instead of
-# registering new ones (which would never be freed).
+# One view per source: packing every generation reuses the same arrays instead of registering new ones (which would
+# never be freed).
 _views: dict[tuple, mx.array] = {}
+# One open file (header read and file mapped once) per path
+_files: dict[str, "mx.SafetensorsFile"] = {}
 
 
 def enabled() -> bool:
@@ -86,51 +78,58 @@ def page_aligned(path: Path) -> bool:
     )
 
 
-def _view(mapping: mmap.mmap, offset: int, nbytes: int, dtype: mx.Dtype, shape: list[int]) -> mx.array:
-    # Metal wraps host memory without a copy only for page-aligned, page-sized ranges: map whole pages
-    # and slice the tail off.
-    padded = -(-nbytes // PAGE) * PAGE
-    raw = mx.from_dlpack(np.frombuffer(mapping, np.uint8, padded, offset))[:nbytes]
-    return raw.view(dtype).reshape(shape) if dtype != mx.uint8 else raw.reshape(shape)
+def _file(path: Path) -> "mx.SafetensorsFile":
+    key = str(Path(path).resolve())
+    f = _files.get(key)
+    if f is None:
+        f = _files[key] = mx.SafetensorsFile(key, zero_copy=True)
+    return f
 
 
-def _registered(mapping: mmap.mmap, offset: int, nbytes: int, dtype: mx.Dtype, shape: list[int]) -> mx.array:
-    key = (id(mapping), offset, nbytes, dtype, tuple(shape))
+def _make(source: _Source) -> mx.array:
+    f, keys, part = source
+    if len(keys) > 1:
+        return f.get_rows(list(keys))
+    array = f[keys[0]]
+    if part is not None:
+        i, n = part
+        array = mx.split(array, n, axis=0)[i]
+    return array
+
+
+def _registered(source: _Source) -> mx.array:
+    key = (id(source[0]), source[1], source[2])
     array = _views.get(key)
     if array is None:
-        array = _view(mapping, offset, nbytes, dtype, shape)
+        array = _make(source)
         _views[key] = array
-        _origin[id(array)] = (array, mapping, offset, nbytes)
+        _origin[id(array)] = (array, source)
     return array
 
 
 def load(path: Path) -> dict[str, mx.array]:
-    """All tensors of a page-aligned safetensors file as zero-copy views of one read-only mapping."""
+    """All tensors of a page-aligned safetensors file; those MLX maps (they start on a page) are zero-copy views of
+    one read-only mapping, the small rest is read."""
+    f = _file(path)
     header, start = read_header(path)
-    with open(path, "rb") as f:
-        mapping = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+    size = os.path.getsize(path)
     out = {}
-    for key, spec in header.items():
-        if key == "__metadata__":
-            continue
-        a, b = spec["data_offsets"]
-        if b == a:
-            out[key] = mx.zeros(spec["shape"], DTYPES[spec["dtype"]])
-            continue
-        if (start + a) % PAGE or (b - a) % PAGE:
-            raw = mx.array(np.frombuffer(mapping, np.uint8, b - a, start + a))
-            out[key] = raw.view(DTYPES[spec["dtype"]]).reshape(spec["shape"])
-            continue
-        out[key] = _registered(mapping, start + a, b - a, DTYPES[spec["dtype"]], spec["shape"])
+    for key in f.keys():
+        a, b = header[key]["data_offsets"]
+        padded = -(-(b - a) // PAGE) * PAGE
+        if f.mapped and b > a and (start + a) % PAGE == 0 and start + a + padded <= size:
+            out[key] = _registered((f, (key,), None))
+        else:
+            out[key] = f[key]
     return out
 
 
-# id(module) -> [(parameter path, mapping, offset, nbytes, dtype, shape)] of its zero-copy parameters
+# id(module) -> [(parameter path, source)] of its zero-copy parameters
 _streamed: dict[int, list[tuple]] = {}
 
 
 def _placeholders(specs: list[tuple]) -> list[tuple[str, mx.array]]:
-    return [(path, mx.zeros((0,), dtype)) for path, _, _, _, dtype, _ in specs]
+    return [(path, mx.zeros((0,), dtype)) for path, _, dtype in specs]
 
 
 @contextmanager
@@ -150,14 +149,15 @@ def streamed(module):
         for path, array in tree_flatten(module.parameters()):
             entry = _origin.get(id(array))
             if entry is not None and entry[0] is array:
-                specs.append((path, entry[1], entry[2], entry[3], array.dtype, list(array.shape)))
+                source = entry[1]
+                specs.append((path, source, array.dtype))
                 _origin.pop(id(array))
-                _views.pop((id(entry[1]), entry[2], entry[3], array.dtype, tuple(array.shape)), None)
+                _views.pop((id(source[0]), source[1], source[2]), None)
         _streamed[id(module)] = specs
     views = []
-    for _, m, o, n, d, s in specs:
-        view = _view(m, o, n, d, s)
-        _origin[id(view)] = (view, m, o, n)  # so adjacent_view can pack them; dropped again on exit
+    for _, source, _ in specs:
+        view = _make(source)
+        _origin[id(view)] = (view, source)  # so adjacent_view can pack them; dropped again on exit
         views.append(view)
     module.update(tree_unflatten([(spec[0], view) for spec, view in zip(specs, views)]), strict=False)
     try:
@@ -169,36 +169,46 @@ def streamed(module):
 
 
 def adjacent_view(weights: list[mx.array], cache: bool = True) -> mx.array | None:
-    """The row-wise concatenation of `weights` as a view, when they are back-to-back in one mapping.
+    """The row-wise concatenation of `weights` as a view, when they are back-to-back in one mapping: separate
+    tensors written next to each other (QKV, see `align`), or the row blocks of one tensor that `split_rows` made.
 
     cache=False returns a fresh view that nothing else keeps alive (for streamed layers)."""
     entries = [_origin.get(id(w)) for w in weights]
     if any(e is None or e[0] is not w for e, w in zip(entries, weights)):
         return None
-    mapping, offset = entries[0][1], entries[0][2]
-    position = offset
-    for e in entries:
-        if e[1] is not mapping or e[2] != position:
-            return None
-        position += e[3]
-    first = weights[0]
-    if any(w.dtype != first.dtype or w.shape[1:] != first.shape[1:] for w in weights):
+    sources = [e[1] for e in entries]
+    f = sources[0][0]
+    if any(s[0] is not f for s in sources):
         return None
-    rows = sum(w.shape[0] for w in weights)
-    if not cache:
-        return _view(mapping, offset, position - offset, first.dtype, [rows, *first.shape[1:]])
-    return _registered(mapping, offset, position - offset, first.dtype, [rows, *first.shape[1:]])
+    if all(s[2] is not None for s in sources):
+        # all row blocks of one tensor, in order: the tensor itself
+        key, n = sources[0][1], sources[0][2][1]
+        if len(sources) != n or any(s[1] != key or s[2] != (i, n) for i, s in enumerate(sources)):
+            return None
+        source = (f, key, None)
+    elif all(s[2] is None and len(s[1]) == 1 for s in sources):
+        source = (f, tuple(s[1][0] for s in sources), None)
+        if f.get_rows(list(source[1])) is None:     # not back to back in the file
+            return None
+    else:
+        return None
+    return _registered(source) if cache else _make(source)
 
 
 def split_rows(packed: mx.array, parts: int) -> list[mx.array]:
-    """mx.split(packed, parts, axis=0), as registered views when `packed` came from adjacent_view, so the
-    next generation packs the same weights without a copy again."""
+    """mx.split(packed, parts, axis=0), as registered views when `packed` came from this module, so the next
+    generation packs the same weights without a copy again."""
     entry = _origin.get(id(packed))
     if entry is None or entry[0] is not packed:
         return mx.split(packed, parts, axis=0)
-    _, mapping, offset, nbytes = entry
-    rows, step = packed.shape[0] // parts, nbytes // parts
-    return [_registered(mapping, offset + i * step, step, packed.dtype, [rows, *packed.shape[1:]]) for i in range(parts)]
+    f, keys, part = entry[1]
+    if part is not None:
+        return mx.split(packed, parts, axis=0)
+    if len(keys) == parts:          # a packed group: its own tensors
+        return [_registered((f, (k,), None)) for k in keys]
+    if len(keys) == 1:              # row blocks of one tensor
+        return [_registered((f, keys, (i, parts))) for i in range(parts)]
+    return mx.split(packed, parts, axis=0)
 
 
 def _contiguous(path: Path) -> bool:
