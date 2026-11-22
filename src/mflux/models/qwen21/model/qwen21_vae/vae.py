@@ -1,3 +1,5 @@
+import os
+
 import mlx.core as mx
 from mlx import nn
 
@@ -186,6 +188,20 @@ class QwenImage21VAE(Qwen21VAECore):
         return latent.transpose(0, 3, 1, 2)[:, :, None]
 
     def decode(self, latents: mx.array) -> mx.array:
+        # (ain-soph fork) MFLUX_QWEN21_VAE_CACHE_MB: MLX buffer-cache limit while decoding. The float32 strips are
+        # short-lived and every size differs, so a large cache only holds memory; the denoiser before it gains from a
+        # larger one.
+        limit = os.environ.get("MFLUX_QWEN21_VAE_CACHE_MB")
+        if limit is None:
+            return self._decode(latents)
+        previous = mx.set_cache_limit(int(float(limit) * 2**20))
+        mx.clear_cache()
+        try:
+            return self._decode(latents)
+        finally:
+            mx.set_cache_limit(previous)
+
+    def _decode(self, latents: mx.array) -> mx.array:
         latents = self._to_nhwc(latents)
         latents = latents * mx.array(self._std, dtype=latents.dtype) + mx.array(self._mean, dtype=latents.dtype)
         image = self.decoder(self.post_quant_conv(latents), strips=self.decode_mode == VAEBlockDecoder.LOW_MEMORY)
