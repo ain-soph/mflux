@@ -10,9 +10,11 @@
 > | W8A16 text encoder (8-bit weights, BF16 activations) | smaller file, error close to BF16 | `MFLUX_QWEN21_TE_Q8=<dir>`, converter `qwen21_q8` (off) | 16.4 → 10.9 GB; embeds error 2.58 → 3.55 %; encode 0.22 → 0.17 s |
 > | W8A8 text encoder (`int8_convrot`, incl. the generation head) | less page cache | `MFLUX_QWEN21_TE_W8A8=<file>` (off) | −8.8 GB page cache; embeds error 6.2 %, no speedup (not used by us) |
 > | Fused element-wise ops in cached denoise blocks | ~19 ms per block outside GEMM and attention | `QWEN21_FUSION` (default all on; empty = off) | per block 1024² 20.0 → 17.7 ms, 2048² 121.0 → 108.0 ms; byte-identical |
+> | Z-Image: text encoder and DiT streamed separately | MLX wires every live buffer while the GPU runs | `MFLUX_ZERO_COPY_STREAM=1` (off) | Z-Image-Turbo wired peak 15.9 → 8.8 GB; same speed; byte-identical |
+> | Z-Image W8A8 DiT (`int8` ConvRot attention + feed-forward) | faster denoise, half the DiT size | `MFLUX_ZIMAGE_W8A8=<file>`, converter `z_image_w8a8` (off) | 1024² 7.0 → 5.4 s, 2048² 39.0 → 34.2 s; DiT 12.3 → 6.3 GB; step error vs FP32 2 → 4.2 % |
 > | No upper version bounds on runtime dependencies | one shared environment with other engines | — | — |
 >
-> Full numbers: [Qwen-Image-2.1 in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#图片qwen-image-21). Upstream PRs: [#998](https://github.com/mflux-community/mflux/pull/998), [#999](https://github.com/mflux-community/mflux/pull/999), [#1000](https://github.com/mflux-community/mflux/pull/1000) (merged: text-to-image rewrite, W8A8 DiT, VAE row strips now come from upstream).
+> Full numbers: [Qwen-Image-2.1 in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#图片qwen-image-21), Z-Image-Turbo in the same document. Upstream PRs: [#998](https://github.com/mflux-community/mflux/pull/998), [#999](https://github.com/mflux-community/mflux/pull/999), [#1000](https://github.com/mflux-community/mflux/pull/1000) (merged: text-to-image rewrite, W8A8 DiT, VAE row strips now come from upstream).
 
 ![image](src/mflux/assets/logo.jpg)
 
