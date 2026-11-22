@@ -1,3 +1,19 @@
+> **ain-soph fork (`serving` branch, based on upstream `main` d39c963, after v0.24.0).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Zero-copy page-aligned weights | map weights from the page cache instead of copying them | `MFLUX_ZERO_COPY=1` after `python -m mflux.models.common.weights.loading.zero_copy DIR` (off) | process RSS 33.8 → 2.0 GB; byte-identical. Needs the [ain-soph/mlx](https://github.com/ain-soph/mlx/tree/serving) fork (`mx.SafetensorsFile`) |
+> | Per-layer weight streaming (Qwen-Image-2.1 DiT, Qwen3-VL incl. prompt rewriting) | MLX wires every live buffer while the GPU runs | `MFLUX_ZERO_COPY_STREAM=1` (off) | generation wired peak 44–52 → <10 GB; same speed; byte-identical |
+> | W8A8 kernels from MLX (`mx.fast.convrot_*`); zero-copy int8 projections packed as views | one shared kernel with h3-image-mlx; no copy of streamed blocks | with `MFLUX_QWEN21_W8A8` (upstream switch). Needs the ain-soph/mlx fork | rotate-quantize 16384×12288: 7.2 → 2.2 ms; byte-identical GEMM |
+> | Qwen-Image-2.1 VAE: own MLX cache cap while decoding | the decode's short-lived strips fill a large cache | `MFLUX_QWEN21_VAE_CACHE_MB` (off) | — |
+> | Qwen-Image-2.1 VAE decoder in BF16 | the official Turbo VAE is BF16; the FP32 decode takes ~2.4 s of a ~6.5 s Turbo 1024² image | `MFLUX_QWEN21_VAE_DTYPE=bfloat16` (off: float32) | decode 1024² 2.4 → 1.5 s, 2048² 11.2 → 6.8 s; peak −3.8 / −5.5 GB; PSNR 43–53 dB vs FP32 |
+> | W8A16 text encoder (8-bit weights, BF16 activations) | smaller file, error close to BF16 | `MFLUX_QWEN21_TE_Q8=<dir>`, converter `qwen21_q8` (off) | 16.4 → 10.9 GB; embeds error 2.58 → 3.55 %; encode 0.22 → 0.17 s |
+> | W8A8 text encoder (`int8_convrot`, incl. the generation head) | less page cache | `MFLUX_QWEN21_TE_W8A8=<file>` (off) | −8.8 GB page cache; embeds error 6.2 %, no speedup (not used by us) |
+> | Fused element-wise ops in cached denoise blocks | ~19 ms per block outside GEMM and attention | `QWEN21_FUSION` (default all on; empty = off) | per block 1024² 20.0 → 17.7 ms, 2048² 121.0 → 108.0 ms; byte-identical |
+> | No upper version bounds on runtime dependencies | one shared environment with other engines | — | — |
+>
+> Full numbers: [Qwen-Image-2.1 in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#图片qwen-image-21). Upstream PRs: [#998](https://github.com/mflux-community/mflux/pull/998), [#999](https://github.com/mflux-community/mflux/pull/999), [#1000](https://github.com/mflux-community/mflux/pull/1000) (merged: text-to-image rewrite, W8A8 DiT, VAE row strips now come from upstream).
+
 ![image](src/mflux/assets/logo.jpg)
 
 [![MFLUX](https://img.shields.io/pypi/v/mflux?label=MFLUX&logo=pypi&logoColor=white)](https://pypi.org/project/mflux/)
