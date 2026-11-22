@@ -71,12 +71,16 @@ class QwenImage21TextEncoder(nn.Module):
         mask = (idx[:, None] >= idx[None, :])[None, None]
         total = hidden.shape[1] + max_new_tokens
         caches = []
-        if zero_copy.streaming():
-            raise RuntimeError("Greedy decoding (enhance_prompt, auto_mask, verify) is not supported with MFLUX_ZERO_COPY_STREAM=1.")
+        # Streamed zero-copy layers (MFLUX_ZERO_COPY_STREAM=1) hold their weights only inside streamed(), so each
+        # layer's output is evaluated before its weights are dropped; without streaming this is a no-op wrapper.
+        streaming = zero_copy.streaming()
         for index, layer in enumerate(model.layers):
-            hidden, cache = layer(hidden, attention_mask=mask, position_embeddings=rope, max_cache_length=total)
-            if deepstack is not None and index < len(deepstack):
-                hidden[:, image_indices] += deepstack[index].astype(hidden.dtype)[None]
+            with zero_copy.streamed(layer):
+                hidden, cache = layer(hidden, attention_mask=mask, position_embeddings=rope, max_cache_length=total)
+                if deepstack is not None and index < len(deepstack):
+                    hidden[:, image_indices] += deepstack[index].astype(hidden.dtype)[None]
+                if streaming:
+                    mx.eval(hidden)
             caches.append(cache)
         mx.eval(hidden)
         position = int(np.asarray(positions).max()) + 1
@@ -89,7 +93,10 @@ class QwenImage21TextEncoder(nn.Module):
             hidden = model.embed_tokens(mx.array([[next_id]]))
             rope = model.rotary_emb(hidden, mx.full((3, 1, 1), position, dtype=mx.int32))
             for index, layer in enumerate(model.layers):
-                hidden, caches[index] = layer(hidden, position_embeddings=rope, past_key_value=caches[index])
+                with zero_copy.streamed(layer):
+                    hidden, caches[index] = layer(hidden, position_embeddings=rope, past_key_value=caches[index])
+                    if streaming:
+                        mx.eval(hidden)
             mx.eval(hidden)
             position += 1
         return generated
