@@ -154,15 +154,24 @@ def streamed(module):
                 _origin.pop(id(array))
                 _views.pop((id(entry[1]), entry[2], entry[3], array.dtype, tuple(array.shape)), None)
         _streamed[id(module)] = specs
-    module.update(tree_unflatten([(p, _view(m, o, n, d, s)) for p, m, o, n, d, s in specs]), strict=False)
+    views = []
+    for _, m, o, n, d, s in specs:
+        view = _view(m, o, n, d, s)
+        _origin[id(view)] = (view, m, o, n)  # so adjacent_view can pack them; dropped again on exit
+        views.append(view)
+    module.update(tree_unflatten([(spec[0], view) for spec, view in zip(specs, views)]), strict=False)
     try:
         yield
     finally:
         module.update(tree_unflatten(_placeholders(specs)), strict=False)
+        for view in views:
+            _origin.pop(id(view), None)
 
 
-def adjacent_view(weights: list[mx.array]) -> mx.array | None:
-    """The row-wise concatenation of `weights` as a view, when they are back-to-back in one mapping."""
+def adjacent_view(weights: list[mx.array], cache: bool = True) -> mx.array | None:
+    """The row-wise concatenation of `weights` as a view, when they are back-to-back in one mapping.
+
+    cache=False returns a fresh view that nothing else keeps alive (for streamed layers)."""
     entries = [_origin.get(id(w)) for w in weights]
     if any(e is None or e[0] is not w for e, w in zip(entries, weights)):
         return None
@@ -176,6 +185,8 @@ def adjacent_view(weights: list[mx.array]) -> mx.array | None:
     if any(w.dtype != first.dtype or w.shape[1:] != first.shape[1:] for w in weights):
         return None
     rows = sum(w.shape[0] for w in weights)
+    if not cache:
+        return _view(mapping, offset, position - offset, first.dtype, [rows, *first.shape[1:]])
     return _registered(mapping, offset, position - offset, first.dtype, [rows, *first.shape[1:]])
 
 
