@@ -21,6 +21,7 @@ from mflux.models.z_image.model.z_image_vae.vae import VAE
 from mflux.models.z_image.variants.controlnet.transformer_controlnet import ZImageControlNet, ZImageControlNetConfig
 from mflux.models.z_image.weights.z_image_controlnet_weight_definition import ZImageControlnetWeightDefinition
 from mflux.models.z_image.weights.z_image_lora_mapping import ZImageLoRAMapping
+from mflux.models.z_image.weights.z_image_w8a8 import ZImageW8A8
 from mflux.models.z_image.weights.z_image_weight_definition import (
     ZImageNoTextEncoderWeightDefinition,
     ZImageWeightDefinition,
@@ -48,6 +49,12 @@ class ZImageInitializer:
             ZImageInitializer._check_ssd_stream(quantize, lora_paths, bake_lora, compute_precision)
         precision = ComputePrecision(compute_precision)
         definition = ZImageNoTextEncoderWeightDefinition if small_text_encoder else ZImageWeightDefinition
+        # (ain-soph fork) MFLUX_ZIMAGE_W8A8: the DiT comes from an int8 ConvRot file, the rest from the checkpoint.
+        w8a8 = ZImageW8A8.validate(quantize, lora_paths)
+        if w8a8 is not None:
+            if ssd_stream:
+                raise ValueError("--ssd-stream cannot be combined with MFLUX_ZIMAGE_W8A8: the int8 DiT is not streamed.")
+            definition = ZImageW8A8.without_transformer(definition)
         path = PrequantizedResolution.weights_root(
             model_config,
             model_path,
@@ -59,13 +66,20 @@ class ZImageInitializer:
         ZImageInitializer._init_config(model, model_config)
         model.small_text_encoder = small_text_encoder
         model.ssd_stream = ssd_stream
-        if small_text_encoder:
+        if w8a8 is not None:
+            weights = WeightLoader.load(weight_definition=definition, model_path=path)
+        elif small_text_encoder:
             weights = ZImageInitializer._load_weights_without_text_encoder(path)
         else:
             weights = ZImageInitializer._load_weights(path)
         ZImageInitializer._init_tokenizers(model, path)
         ZImageInitializer._init_models(model)
+        if w8a8 is not None:
+            ZImageW8A8.convert(model.transformer)
         ZImageInitializer._apply_weights(model, weights, quantize)
+        if w8a8 is not None:
+            ZImageW8A8.load(model.transformer, w8a8)
+        model._w8a8_checkpoint = w8a8
         if small_text_encoder:
             model.text_encoder = ZImageSmallTextEncoder.load(bits=model.bits)
         ZImageInitializer._apply_lora(model, lora_paths, lora_scales, bake_lora, weights)
