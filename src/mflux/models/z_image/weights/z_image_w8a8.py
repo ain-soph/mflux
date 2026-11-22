@@ -10,6 +10,13 @@ quantized per output row, mx.fast.convrot_quantize_weight):
 
     python -m mflux.models.z_image.weights.z_image_w8a8 Tongyi-MAI/Z-Image-Turbo OUT.safetensors
 
+The projections are quantized from the checkpoint's stored values (float32 in the official repo), not from the
+bfloat16 copy the pipeline loads, so a float32 checkpoint is rounded once. (The official Z-Image-Turbo DiT stores
+bfloat16-exact values as float32, so for it both sources give the same int8 up to the rotation's summation order.)
+The conversion runs on the CPU stream: the float32 rotation is never a TF32 product (MLX_ENABLE_TF32), the file does
+not depend on the GPU, and only the transformer is loaded (about 8 GB, 15 s on an M5 Ultra). The other layers are cast
+to bfloat16 exactly as the pipeline loads them.
+
 The file is page-aligned, so with MFLUX_ZERO_COPY=1 it is mapped instead of read, and with MFLUX_ZERO_COPY_STREAM=1 the
 transformer holds the mapped weights only while it denoises (see zero_copy.streamed).
 """
@@ -114,17 +121,53 @@ class ZImageW8A8:
         transformer.update(tree_unflatten(list(params.items())), strict=False)
 
     @staticmethod
-    def save(model_path: str, out: Path) -> None:
-        from mflux.models.common.config import ModelConfig
-        from mflux.models.z_image.variants.z_image import ZImage
+    def source_transformer(model_path: str):
+        """The Z-Image transformer with the checkpoint's weights at their stored precision (float32 for the official
+        DiT; the pipeline casts them to bfloat16 on load). Built on the default stream: call it inside
+        mx.stream(mx.cpu) to keep the GPU out."""
+        from dataclasses import replace
 
+        from mflux.models.common.config import ModelConfig
+        from mflux.models.common.resolution.prequantized_resolution import PrequantizedResolution
+        from mflux.models.common.weights.loading.weight_applier import WeightApplier
+        from mflux.models.common.weights.loading.weight_loader import WeightLoader
+        from mflux.models.z_image.model.z_image_transformer.transformer import ZImageTransformer
+        from mflux.models.z_image.weights.z_image_weight_definition import ZImageWeightDefinition
+
+        component = next(c for c in ZImageWeightDefinition.get_components() if c.name == "transformer")
+        stored = replace(component, precision=None)
+
+        class StoredTransformer(ZImageWeightDefinition):
+            @staticmethod
+            def get_components():
+                return [stored]
+
+            @staticmethod
+            def get_download_patterns():
+                return [p for p in ZImageWeightDefinition.get_download_patterns() if p.startswith("transformer/")]
+
+        root = PrequantizedResolution.weights_root(
+            ModelConfig.z_image_turbo(), model_path, None, **PrequantizedResolution.layout(StoredTransformer)
+        )
+        weights = WeightLoader.load(weight_definition=StoredTransformer, model_path=root)
+        transformer = ZImageTransformer()
+        WeightApplier.apply_and_quantize(
+            weights=weights, models={"transformer": transformer}, quantize_arg=None, weight_definition=StoredTransformer
+        )
+        return transformer, component.precision
+
+    @staticmethod
+    def save(model_path: str, out: Path) -> None:
         os.environ.pop(ENV, None)
-        model = ZImage(model_path=model_path, model_config=ModelConfig.z_image_turbo())
-        transformer = model.transformer
-        del model
-        ZImageW8A8.convert(transformer, quantize_weights=True)
-        params = dict(tree_flatten(transformer.parameters()))
-        mx.eval(list(params.values()))
+        with mx.stream(mx.cpu):
+            transformer, precision = ZImageW8A8.source_transformer(model_path)
+            ZImageW8A8.convert(transformer, quantize_weights=True)
+            # Everything but the int8 projections as the pipeline loads it (WeightLoader casts to `precision`)
+            params = {
+                k: v if v.dtype == mx.int8 or k.endswith(".scale") or v.dtype == precision else v.astype(precision)
+                for k, v in tree_flatten(transformer.parameters())
+            }
+            mx.eval(list(params.values()))
         out = Path(out)
         out.parent.mkdir(parents=True, exist_ok=True)
         mx.save_safetensors(str(out), params, {"format": FORMAT}, page_align=True)
