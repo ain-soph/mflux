@@ -9,6 +9,7 @@ from mflux.models.common.latent_creator.latent_creator import Img2Img, LatentCre
 from mflux.models.common.pid_decoder.pid_decoder import pid_decode_latents
 from mflux.models.common.vae.vae_decode_options import VAEDecodeOptions
 from mflux.models.common.vae.vae_util import VAEUtil
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common.weights.saving.model_saver import ModelSaver
 from mflux.models.z_image.latent_creator import ZImageLatentCreator
 from mflux.models.z_image.model.z_image_text_encoder.prompt_encoder import PromptEncoder
@@ -106,15 +107,52 @@ class ZImage(nn.Module):
                 tiling_config=self.tiling_config,
             ),
         )
-        text_encodings, negative_encodings = self._encode_prompts(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            guidance=config.guidance,
-        )
+        # With MFLUX_ZERO_COPY_STREAM=1 (and page-aligned weights) each model holds its zero-copy weights only while
+        # it runs, so the GPU wires the text encoder or the transformer, never both (see zero_copy.streamed).
+        with zero_copy.streamed(self.text_encoder):
+            text_encodings, negative_encodings = self._encode_prompts(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                guidance=config.guidance,
+            )
+            mx.eval([e for e in (text_encodings, negative_encodings) if e is not None])
 
         # 3. Create callback context and call before_loop
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
         ctx.before_loop(latents)
+        with zero_copy.streamed(self.transformer):
+            latents = self._denoise(latents, config, ctx, text_encodings, negative_encodings)
+
+        # 7. Call subscribers after loop
+        ctx.after_loop(latents)
+
+        # 8. Decode the latents and return the image
+        decoded = self._decode_latents(
+            latents=latents,
+            config=config,
+            prompt=prompt,
+            seed=seed,
+            pid_decode=pid_decode,
+            degrade_sigma=pid_degrade_sigma,
+        )
+        return ImageUtil.to_image(
+            decoded_latents=decoded,
+            config=config,
+            seed=seed,
+            prompt=prompt,
+            quantization=self.bits,
+            lora_paths=self.lora_paths,
+            lora_scales=self.lora_scales,
+            image_path=config.image_path,
+            image_strength=config.image_strength,
+            generation_time=config.time_steps.format_dict["elapsed"],
+            negative_prompt=negative_prompt,
+            pid_decode=pid_decode,
+            pid_degrade_sigma=pid_degrade_sigma,
+            generation_parameters=self._generation_parameters(),
+        )
+
+    def _denoise(self, latents, config, ctx, text_encodings, negative_encodings) -> mx.array:
         # A compiled trace would not see the weights the streamer installs and removes around each block.
         predict = self._predict(self.transformer, compile_predict=not self.ssd_stream)
 
@@ -147,36 +185,11 @@ class ZImage(nn.Module):
                     f"Stopping image generation at step {t + 1}/{config.num_inference_steps}"
                 )
 
-        # 7. Call subscribers after loop
-        # The predict closure holds the transformer. Delete it so that --low-ram can free the transformer before decode.
+        # The predict closure holds the transformer. Delete it so that --low-ram can free the transformer before decode,
+        # and so that a streamed transformer drops its weights when the block ends.
         del predict
-        ctx.after_loop(latents)
-
-        # 8. Decode the latents and return the image
-        decoded = self._decode_latents(
-            latents=latents,
-            config=config,
-            prompt=prompt,
-            seed=seed,
-            pid_decode=pid_decode,
-            degrade_sigma=pid_degrade_sigma,
-        )
-        return ImageUtil.to_image(
-            decoded_latents=decoded,
-            config=config,
-            seed=seed,
-            prompt=prompt,
-            quantization=self.bits,
-            lora_paths=self.lora_paths,
-            lora_scales=self.lora_scales,
-            image_path=config.image_path,
-            image_strength=config.image_strength,
-            generation_time=config.time_steps.format_dict["elapsed"],
-            negative_prompt=negative_prompt,
-            pid_decode=pid_decode,
-            pid_degrade_sigma=pid_degrade_sigma,
-            generation_parameters=self._generation_parameters(),
-        )
+        mx.eval(latents)
+        return latents
 
     def _generation_parameters(self) -> dict:
         return {
@@ -226,6 +239,11 @@ class ZImage(nn.Module):
         return VAEUtil.decode(vae=self.vae, latent=unpacked, tiling_config=self.tiling_config)
 
     def save_model(self, base_path: str) -> None:
+        if getattr(self, "_w8a8_checkpoint", None) is not None:
+            raise ValueError(
+                "A model loaded with MFLUX_ZIMAGE_W8A8 cannot be saved: its DiT is the int8 file "
+                f"({self._w8a8_checkpoint}). Load it without the variable to save the checkpoint."
+            )
         if self.small_text_encoder:
             raise ValueError(
                 "save_model() is not supported with small_text_encoder: it would write the Qwen3-1.7B student "
