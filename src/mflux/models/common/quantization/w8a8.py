@@ -131,3 +131,18 @@ class W8A8Linear(nn.Module):
         else:
             setattr(module, name, w8a8)
         return w8a8
+
+
+class ConvRotEmbedding(nn.Module):
+    """Embedding table stored as int8 convrot rows (rotated along the hidden size, one float32 scale per row).
+    A lookup dequantizes the selected rows and undoes the rotation (H256 is symmetric and orthonormal)."""
+
+    def __init__(self, num_embeddings: int, dims: int):
+        super().__init__()
+        self.weight = mx.zeros((num_embeddings, dims), dtype=mx.int8)
+        self.scale = mx.zeros((num_embeddings,), dtype=mx.float32)
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        rows = self.weight[ids].astype(mx.float32) * self.scale[ids][..., None]
+        shape = rows.shape
+        return (rows.reshape(-1, GROUP) @ H256).reshape(shape).astype(mx.bfloat16)

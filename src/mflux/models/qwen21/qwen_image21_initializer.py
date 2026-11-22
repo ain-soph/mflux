@@ -85,9 +85,13 @@ class QwenImage21Initializer:
         model.transformer = QwenImage21Transformer(model._component_configs["transformer"])
         # MFLUX_QWEN21_W8A8: the DiT comes from an int8_convrot file, the rest from the checkpoint.
         definition, w8a8 = Qwen21W8A8.prepare(model, definition, quantize, lora_paths)
+        # (ain-soph fork) MFLUX_QWEN21_TE_W8A8: the text encoder from an int8_convrot file too.
+        definition, te_w8a8 = Qwen21W8A8.prepare_text_encoder(model, definition, quantize, small_text_encoder)
         Qwen21Initializer.load_components(model, root, definition, quantize, validate=True)
         if w8a8 is not None:
             Qwen21W8A8.load(model.transformer, w8a8)
+        if te_w8a8 is not None:
+            Qwen21W8A8.load_text_encoder(model.text_encoder, te_w8a8)
         Qwen21Initializer.apply_lora(model, lora_paths, lora_scales, bake_lora)
         model.compute_precision = precision
         if compute_precision is not None:

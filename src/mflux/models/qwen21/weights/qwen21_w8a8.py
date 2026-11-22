@@ -13,7 +13,7 @@ from pathlib import Path
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
-from mflux.models.common.quantization.w8a8 import GROUP, W8A8Linear
+from mflux.models.common.quantization.w8a8 import GROUP, ConvRotEmbedding, W8A8Linear
 from mflux.models.common.weights.loading import zero_copy
 
 PROJECTIONS = (
@@ -28,6 +28,11 @@ PROJECTIONS = (
 # The checkpoint fuses the feed-forward input projections as gate_up = [gate_layer; proj] (rows): undoing the rotation,
 # the first half matches gate_layer (cos 0.99996) and the second proj; the per-row int8 weights are within 0.9% of bf16.
 FUSED = {"img_mlp.gate_up": ("img_mlp.gate_layer", "img_mlp.proj")}
+# (ain-soph fork) MFLUX_QWEN21_TE_W8A8: the Qwen3-VL text encoder's projections in its 36 language layers.
+TEXT_PROJECTIONS = (
+    "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+)
 
 
 class Qwen21W8A8:
@@ -191,3 +196,72 @@ class Qwen21W8A8:
             attn, mlp = block.attn, block.img_mlp
             attn._w8a8_qkv = W8A8Linear.pack((attn.to_q, attn.to_k, attn.to_v))
             mlp._w8a8_gate_proj = W8A8Linear.pack((mlp.gate_layer, mlp.proj))
+
+    # (ain-soph fork) MFLUX_QWEN21_TE_W8A8=<file> does the same for the Qwen3-VL text encoder (Comfy-Org
+    # qwen3vl_8b_int8_convrot): the 36 language layers' projections and the generation head (lm_head, used by
+    # enhance_prompt, auto_mask and verify) become W8A8Linear and the token embedding a ConvRotEmbedding; the vision
+    # tower stays bfloat16 as stored.
+    @staticmethod
+    def text_checkpoint() -> Path | None:
+        path = os.environ.get("MFLUX_QWEN21_TE_W8A8")
+        return Path(path) if path else None
+
+    @staticmethod
+    def prepare_text_encoder(model, definition, quantize: int | None, small_text_encoder: bool):
+        """Before loading: with MFLUX_QWEN21_TE_W8A8 set, swap the text encoder's layers and return a weight
+        definition without the text encoder plus that file; else (definition, None)."""
+        path = None if small_text_encoder else Qwen21W8A8.text_checkpoint()
+        if path is None:
+            return definition, None
+        if quantize is not None:
+            raise ValueError("MFLUX_QWEN21_TE_W8A8 already quantizes the text encoder; do not pass quantize.")
+        if not path.exists():
+            raise FileNotFoundError(f"MFLUX_QWEN21_TE_W8A8 points to a missing file: {path}")
+        Qwen21W8A8.convert_text_encoder(model.text_encoder)
+
+        class WithoutTextEncoder(definition):
+            @staticmethod
+            def get_components():
+                return [c for c in definition.get_components() if c.name != "text_encoder"]
+
+        return WithoutTextEncoder, path
+
+    @staticmethod
+    def convert_text_encoder(text_encoder) -> None:
+        model = text_encoder.language_model
+        for layer in model.layers:
+            for path in TEXT_PROJECTIONS:
+                parent, name = path.split(".")
+                W8A8Linear.replace(getattr(layer, parent), name)
+        vocab, dims = model.embed_tokens.weight.shape
+        model.embed_tokens = ConvRotEmbedding(vocab, dims)
+        W8A8Linear.replace(text_encoder, "lm_head")
+
+    @staticmethod
+    def load_text_encoder(text_encoder, path: Path) -> None:
+        from mflux.models.common_models.qwen3_vl.qwen3_vl_multimodal import Qwen3VLMultimodal
+
+        weights = Qwen21W8A8._read(path)
+        Qwen21W8A8._check_quant(weights)
+        params = {}
+        for key, value in weights.items():
+            if key.startswith("lm_head."):
+                target = key
+            elif key.startswith("model.visual."):
+                target = "visual." + key[len("model.visual.") :]
+                value = Qwen3VLMultimodal.vision_weight(target, value)
+            elif key.startswith("model."):
+                target = "language_model." + key[len("model.") :]
+            else:
+                raise ValueError(f"{path}: unexpected key {key}")
+            if target.endswith(".weight_scale"):
+                target, value = target[: -len(".weight_scale")] + ".scale", value.reshape(-1)
+            params[target] = value
+        # inv_freq buffers are computed by the modules, not stored
+        expected = {p for p, _ in tree_flatten(text_encoder.parameters()) if not p.endswith(".inv_freq")}
+        missing, extra = expected - set(params), set(params) - expected
+        if missing or extra:
+            raise ValueError(
+                f"{path}: missing {sorted(missing)[:5]} ({len(missing)}), unexpected {sorted(extra)[:5]} ({len(extra)})"
+            )
+        text_encoder.update(tree_unflatten(list(params.items())), strict=False)
