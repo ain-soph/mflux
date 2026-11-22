@@ -222,6 +222,10 @@ class Qwen21Attention(nn.Module):
         if self._w8a8_qkv is not None:
             query, key, value = W8A8Linear.fused(hidden_states, self._w8a8_qkv)
             return query, key, value
+        if isinstance(self.to_q, W8A8Linear) and isinstance(self.to_k, W8A8Linear) and isinstance(self.to_v, W8A8Linear):
+            # zero-copy W8A8 (Qwen21W8A8.load does not pack): one GEMM on a view of the adjacent weights
+            query, key, value = W8A8Linear.fused_layers(hidden_states, (self.to_q, self.to_k, self.to_v))
+            return query, key, value
         if self._qkv_weight is not None:
             query, key, value = mx.split(hidden_states @ self._qkv_weight.T, 3, axis=-1)
             return query, key, value

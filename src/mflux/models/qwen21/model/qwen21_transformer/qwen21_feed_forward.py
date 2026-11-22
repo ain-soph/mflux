@@ -20,6 +20,8 @@ class Qwen21SwiGLUFeedForward(nn.Module):
         hidden_states = self.compute_precision.to_compute(hidden_states)
         if self._w8a8_gate_proj is not None:
             gate, proj = W8A8Linear.fused(hidden_states, self._w8a8_gate_proj)
+        elif isinstance(self.gate_layer, W8A8Linear) and isinstance(self.proj, W8A8Linear):
+            gate, proj = W8A8Linear.fused_layers(hidden_states, (self.gate_layer, self.proj))
         elif self._gate_proj_weight is None:
             gate, proj = self.gate_layer(hidden_states), self.proj(hidden_states)
         else:
