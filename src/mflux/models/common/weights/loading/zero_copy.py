@@ -195,6 +195,12 @@ def adjacent_view(weights: list[mx.array], cache: bool = True) -> mx.array | Non
     return _registered(source) if cache else _make(source)
 
 
+def is_view(array: mx.array) -> bool:
+    """Whether `array` is a zero-copy view handed out here."""
+    entry = _origin.get(id(array))
+    return entry is not None and entry[0] is array
+
+
 def split_rows(packed: mx.array, parts: int) -> list[mx.array]:
     """mx.split(packed, parts, axis=0), as registered views when `packed` came from this module, so the next
     generation packs the same weights without a copy again."""

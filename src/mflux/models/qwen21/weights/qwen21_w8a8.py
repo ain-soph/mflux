@@ -14,6 +14,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
 from mflux.models.common.quantization.w8a8 import GROUP, W8A8Linear
+from mflux.models.common.weights.loading import zero_copy
 
 PROJECTIONS = (
     "attn.to_q",
@@ -137,6 +138,9 @@ class Qwen21W8A8:
             if len(files) != 1:
                 raise ValueError(f"{path} must hold exactly one safetensors file")
             path = files[0]
+        # a page-aligned file (zero_copy.align) loads as views of one mapping, so it can be streamed per block
+        if zero_copy.enabled() and zero_copy.page_aligned(path):
+            return zero_copy.load(path)
         return mx.load(str(path))
 
     @staticmethod
@@ -159,11 +163,16 @@ class Qwen21W8A8:
                 params[f"{prefix}.{name}"] = value
                 continue
             block, parts = prefix[: -len(fused)], FUSED[fused]
-            for part, half in zip(parts, mx.split(value, len(parts))):
+            # zero-copy: registered views, so streaming releases each half with its block and fused_layers can
+            # pack them again without a copy
+            halves = zero_copy.split_rows(value, len(parts)) if leaf == "weight" else mx.split(value, len(parts))
+            for part, half in zip(parts, halves):
                 params[f"{block}{part}.{name}"] = half
         params = Qwen21Initializer._normalize_transformer_weights(params)
         Qwen21W8A8._check_complete(path, transformer, params)
         transformer.update(tree_unflatten(list(params.items())), strict=False)
+        if any(zero_copy.is_view(v) for k, v in params.items() if v.dtype == mx.int8):
+            return  # zero-copy weights stay views; the blocks pack them per call (W8A8Linear.fused_layers)
         for block in transformer.transformer_blocks:
             attn, mlp = block.attn, block.img_mlp
             attn._w8a8_qkv = W8A8Linear.pack((attn.to_q, attn.to_k, attn.to_v))
