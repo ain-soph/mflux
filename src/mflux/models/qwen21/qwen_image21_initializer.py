@@ -165,6 +165,15 @@ class QwenImage21Initializer:
         files = [root] if root.is_file() else sorted(root.glob("*.safetensors"))
         if len(files) != 1:
             raise ValueError(f"Expected one ControlNet .safetensors file in {root}, found {len(files)}.")
+        # (ain-soph fork) A W8A8 file written by qwen21_controlnet_w8a8 (int8 ConvRot projections, page-aligned for
+        # zero-copy streaming) is recognised by its metadata.
+        from mflux.models.qwen21.weights import qwen21_controlnet_w8a8
+
+        if qwen21_controlnet_w8a8.file_classes(files[0]) is not None:
+            if model.bits is not None:
+                raise ValueError("A W8A8 ControlNet file cannot be combined with quantize.")
+            qwen21_controlnet_w8a8.load(model.controlnet, files[0])
+            return
         # The checkpoint holds the control branch only (control_img_in and the control blocks), named as the
         # module names them, so a strict load is the check that the file is this ControlNet.
         weights = [(key, value.astype(ModelConfig.precision)) for key, value in mx.load(str(files[0])).items()]

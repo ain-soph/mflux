@@ -2,6 +2,7 @@
 import mlx.core as mx
 from mlx import nn
 
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer_block import Qwen21TransformerBlock
 from mflux.models.qwen21.model.qwen21_transformer.qwen_image21_transformer import QwenImage21Transformer
@@ -32,6 +33,8 @@ class QwenImage21ControlNet(nn.Module):
         layers = list(config.get("control_layers") or range(0, config["num_layers"], 2))
         if layers[0] != 0:
             raise ValueError("The first control layer must be 0: that block merges the control input.")
+        if any(a >= b for a, b in zip(layers, layers[1:])):
+            raise ValueError("The control layers must be in increasing order.")
         self._slots = {layer: slot for slot, layer in enumerate(layers)}
         self.control_blocks = [
             QwenImage21ControlBlock(
@@ -86,17 +89,28 @@ class QwenImage21ControlNet(nn.Module):
         modulation = transformer.modulation(time)
         target_mask, rope = layout.target_mask, layout.rope
 
-        skips = []
-        c = self.control_blocks[0].before_proj(control) + x
-        for block in self.control_blocks:
-            c, _ = block.forward_reference(c, modulation, target_mask, layout, rope, key_valid=key_valid)
-            skips.append(block.after_proj(c))
-            mx.eval(c, skips[-1])
-
+        # The control chain only reads its own stream, so each control block runs just before the base block
+        # that takes its skip: one skip is alive at a time instead of all of them (same operations, same result).
+        # Every block holds its zero-copy weights only while it runs (MFLUX_ZERO_COPY_STREAM, zero_copy.streamed).
+        c = None
         for index, block in enumerate(transformer.transformer_blocks):
-            x, _ = block.forward_reference(x, modulation, target_mask, layout, rope, key_valid=key_valid)
-            if index in self._slots:
-                x = x + skips[self._slots[index]] * control_scale
-            mx.eval(x)
+            slot = self._slots.get(index)
+            skip = None
+            if slot is not None:
+                control_block = self.control_blocks[slot]
+                with zero_copy.streamed(control_block):
+                    if slot == 0:
+                        c = control_block.before_proj(control) + x
+                    c, _ = control_block.forward_reference(
+                        c, modulation, target_mask, layout, rope, key_valid=key_valid
+                    )
+                    skip = control_block.after_proj(c)
+                    mx.eval(c, skip)
+            with zero_copy.streamed(block):
+                x, _ = block.forward_reference(x, modulation, target_mask, layout, rope, key_valid=key_valid)
+                if skip is not None:
+                    x = x + skip * control_scale
+                mx.eval(x)
+            del skip
         scale = Qwen21TransformerBlock.select_rows(transformer.norm_out.linear(nn.silu(time)), target_mask)
         return transformer.proj_out(transformer.norm_out(x, scale))[:, -layout.target_tokens :]
