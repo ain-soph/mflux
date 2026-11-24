@@ -135,8 +135,18 @@ class QwenImage21Controlnet(nn.Module):
         shapes = [(1, height // 16, width // 16)]
         layout = QwenImage21Layout.create(slots, shapes, self.transformer.axes)
         negative_layout = QwenImage21Layout.create(negative[1], shapes, self.transformer.axes) if negative else None
-        control_context = self._control_context(control, source, mask_image, width, height).astype(prompt_embeds.dtype)
-        mx.eval(control_context)
+        # (ain-soph fork) The control image goes through the float32 VAE encoder at the full output size. Its freed
+        # buffers would stay in MLX's buffer cache, which is wired while the GPU runs: at 2048² that raised the peak of
+        # the whole generation from 9.6 to 13-14 GB. Encode without a cache (same result, same speed).
+        previous = mx.set_cache_limit(0)
+        try:
+            control_context = self._control_context(control, source, mask_image, width, height).astype(
+                prompt_embeds.dtype
+            )
+            mx.eval(control_context)
+        finally:
+            mx.set_cache_limit(previous)
+            mx.clear_cache()
         mx.random.seed(seed)
         latents = mx.random.normal((1, 64, 1, height // 16, width // 16)).astype(prompt_embeds.dtype)
         latents = QwenImage21LatentCreator.pack_latents(latents)
