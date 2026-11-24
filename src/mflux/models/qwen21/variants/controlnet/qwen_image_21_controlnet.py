@@ -63,6 +63,26 @@ class QwenImage21Controlnet(nn.Module):
             compute_precision=compute_precision,
         )
 
+    @classmethod
+    def from_model(cls, model: nn.Module, controlnet_path: str) -> "QwenImage21Controlnet":
+        """(ain-soph fork) The ControlNet pipeline on the components of a Qwen-Image-2.1 model that is already loaded
+        (QwenImage21Edit, with any of its loading options such as MFLUX_QWEN21_W8A8 and zero-copy streaming): it
+        shares the transformer, the text encoder, the VAE, the processor and the prompt cache, and loads only the
+        control branch from controlnet_path (the original checkpoint or a qwen21_controlnet_w8a8 file)."""
+        from mflux.models.qwen21.variants.controlnet.qwen_image21_controlnet_transformer import QwenImage21ControlNet
+
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        own = set(vars(self))
+        # nn.Module keeps child modules, arrays, dicts and lists as items and everything else as attributes
+        dict.update(self, model)
+        for key, value in vars(model).items():
+            if key not in own:
+                object.__setattr__(self, key, value)
+        self.controlnet = QwenImage21ControlNet(model._component_configs["transformer"])
+        QwenImage21Initializer._load_original_controlnet(self, controlnet_path)
+        return self
+
     def generate_image(
         self,
         seed: int,
