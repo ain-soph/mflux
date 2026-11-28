@@ -215,3 +215,35 @@ def test_vae_tiling_options_are_reported_as_ignored_with_ssd_stream(monkeypatch)
     monkeypatch.setattr("sys.argv", ["mflux-generate-moss-image", "--ssd-stream", "--vae-tiling"])
     with pytest.warns(UserWarning, match="--vae-tiling is ignored"):
         CommandLineParser.warn_ignored_options(SSD_STREAM_IGNORED_OPTIONS)
+
+
+def test_align_and_load_mflux_save_checkpoint_zero_copy(tmp_path, monkeypatch):
+    from mflux.models.common.weights.loading import zero_copy
+    from mflux.models.common.weights.loading.weight_loader import WeightLoader
+
+    comp = tmp_path / "transformer"
+    comp.mkdir()
+    weight = mx.arange(64 * 128, dtype=mx.uint32).reshape(64, 128)  # 32 KiB >= page size
+    bias = mx.zeros((4,), dtype=mx.float32)
+    mx.eval(weight, bias)
+    mx.save_safetensors(
+        str(comp / "0.safetensors"),
+        {"proj.weight": weight, "proj.bias": bias},
+        {"quantization_level": "8", "mflux_version": "0.24.0"},
+    )
+    (comp / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"proj.weight": "0.safetensors", "proj.bias": "0.safetensors"}})
+    )
+
+    final = zero_copy.align(comp)
+    assert final.name == "model.safetensors"
+    assert not (comp / "model.safetensors.index.json").exists()
+
+    monkeypatch.setenv("MFLUX_ZERO_COPY", "1")
+    weights, q_level, version = WeightLoader._try_load_mflux_format(comp)
+    assert q_level == 8
+    assert version == "0.24.0"
+    assert zero_copy.is_view(weights["proj"]["weight"]) is True
+    zero_copy._files.clear()
+    zero_copy._views.clear()
+    zero_copy._origin.clear()

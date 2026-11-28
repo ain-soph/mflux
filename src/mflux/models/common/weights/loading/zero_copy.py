@@ -312,6 +312,9 @@ def align(component_dir: Path) -> Path:
     index = component_dir / (shards[0].name.split("-0000")[0] + ".safetensors.index.json")
     if len(shards) > 1 and index.exists():
         index.unlink()
+    saved_index = component_dir / "model.safetensors.index.json"
+    if saved_index.exists():
+        saved_index.unlink()
     final = component_dir / name
     target.rename(final)
     print(f"{component_dir}: {len(shards)} file(s) -> {final.name}, {len(keys)} tensors, page {PAGE}")

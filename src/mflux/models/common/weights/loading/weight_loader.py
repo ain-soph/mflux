@@ -267,12 +267,17 @@ class WeightLoader:
         present = [path / name for name in indexed if (path / name).is_file()] if indexed else []
 
         # Check metadata on first file
-        data = mx.load(str(present[0] if present else shard_files[0]), return_metadata=True)
-        if len(data) <= 1:
+        meta_shard = present[0] if present else shard_files[0]
+        if zero_copy.enabled() and zero_copy.page_aligned(meta_shard):
+            meta = zero_copy.read_header(meta_shard)[0].get("__metadata__") or {}
+        else:
+            data = mx.load(str(meta_shard), return_metadata=True)
+            meta = data[1] if len(data) > 1 else {}
+        if not meta:
             return None, None, None
 
-        quantization_level_str = data[1].get("quantization_level")
-        mflux_version = data[1].get("mflux_version")
+        quantization_level_str = meta.get("quantization_level")
+        mflux_version = meta.get("mflux_version")
 
         # If no mflux metadata, this isn't our format
         if quantization_level_str is None and mflux_version is None:
@@ -296,8 +301,11 @@ class WeightLoader:
         # Load all shards
         all_weights: dict[str, mx.array] = {}
         for shard in shard_files:
-            shard_data = mx.load(str(shard), return_metadata=True)
-            all_weights.update(dict(shard_data[0].items()))
+            if zero_copy.enabled() and zero_copy.page_aligned(shard):
+                all_weights.update(zero_copy.load(shard))
+            else:
+                shard_data = mx.load(str(shard), return_metadata=True)
+                all_weights.update(dict(shard_data[0].items()))
 
         unflattened = tree_unflatten(list(all_weights.items()))
         return unflattened, quantization_level, mflux_version
