@@ -1,9 +1,12 @@
+from contextlib import nullcontext
+
 import mlx.core as mx
 from mlx import nn
 
 from mflux.models.common.config.config import Config
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.step_cache.step_cache import StepCache
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common.weights.saving.model_saver import ModelSaver
 from mflux.models.common_models.qwen3_5 import Qwen35TextModel
 from mflux.models.flux2.model.flux2_vae.vae import Flux2VAE
@@ -79,27 +82,33 @@ class MOSSImage(nn.Module):
             num_inference_steps=num_inference_steps,
         )
         do_cfg = config.guidance != 1.0
-        positive = self._encode_prompt(prompt)
-        negative = self._encode_prompt(negative_prompt or "") if do_cfg else None
+        # MFLUX_ZERO_COPY_STREAM=1: drop text_encoder zero-copy views before transformer views are wired.
+        need_te = not self.ssd_stream and (
+            prompt not in self.prompt_cache or (do_cfg and (negative_prompt or "") not in self.prompt_cache)
+        )
+        with (zero_copy.streamed(self.text_encoder) if need_te else nullcontext()):
+            positive = self._encode_prompt(prompt)
+            negative = self._encode_prompt(negative_prompt or "") if do_cfg else None
         timesteps = config.scheduler.timesteps.tolist()
         step_cache = StepCache.for_run(config, ratio=step_cache_ratio, signal_fn=self.transformer.time_signal)
 
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
         ctx.before_loop(latents)
-        for t in config.time_steps:
-            try:
-                noise = step_cache.reuse(t)
-                if noise is None:
-                    noise = self._predict(latents, timesteps[t], positive, negative, config.guidance, skip_layers)
-                    step_cache.store(noise)
-                latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
-                ctx.in_loop(t, latents)
-                mx.eval(latents)
-            except KeyboardInterrupt:  # noqa: PERF203
-                ctx.interruption(t, latents)
-                raise StopImageGenerationException(
-                    f"Stopping image generation at step {t + 1}/{config.num_inference_steps}"
-                )
+        with (nullcontext() if self.ssd_stream else zero_copy.streamed(self.transformer)):
+            for t in config.time_steps:
+                try:
+                    noise = step_cache.reuse(t)
+                    if noise is None:
+                        noise = self._predict(latents, timesteps[t], positive, negative, config.guidance, skip_layers)
+                        step_cache.store(noise)
+                    latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
+                    ctx.in_loop(t, latents)
+                    mx.eval(latents)
+                except KeyboardInterrupt:  # noqa: PERF203
+                    ctx.interruption(t, latents)
+                    raise StopImageGenerationException(
+                        f"Stopping image generation at step {t + 1}/{config.num_inference_steps}"
+                    )
         ctx.after_loop(latents)
 
         decoded = self.vae.decode_packed_latents(
