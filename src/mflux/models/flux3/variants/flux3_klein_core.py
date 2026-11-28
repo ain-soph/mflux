@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from pathlib import Path
 
 import mlx.core as mx
@@ -7,6 +8,7 @@ from mflux.cli.defaults import defaults as ui_defaults
 from mflux.models.common.config.config import Config
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.vae.vae_decode_options import VAEDecodeOptions
+from mflux.models.common.weights.loading import zero_copy
 from mflux.models.common.weights.saving.model_saver import ModelSaver
 from mflux.models.flux2.model.flux2_text_encoder.qwen3_text_encoder import Qwen3TextEncoder
 from mflux.models.flux2.model.flux2_vae.vae import Flux2VAE
@@ -81,8 +83,11 @@ class _Flux3KleinCore(nn.Module):
 
         # 1. Encode the prompt; CFG's unconditional branch is the empty prompt, encoded here because --low-ram
         # frees the text encoder before the loop.
-        text_tokens, text_ids = self._encode_prompt(prompt)
-        uncond_tokens, uncond_ids = (None, None) if flow_map else self._encode_prompt("")
+        need_te = prompt not in self.prompt_cache or (not flow_map and "" not in self.prompt_cache)
+        with (zero_copy.streamed(self.text_encoder) if need_te else nullcontext()):
+            text_tokens, text_ids = self._encode_prompt(prompt)
+            uncond_tokens, uncond_ids = (None, None) if flow_map else self._encode_prompt("")
+            mx.eval([t for t in (text_tokens, text_ids, uncond_tokens, uncond_ids) if t is not None])
 
         # 2. Prepare latents
         h, w = Flux3LatentCreator.latent_shape(config.height, config.width)
@@ -95,33 +100,36 @@ class _Flux3KleinCore(nn.Module):
         scheduler = Flux3FlowMapScheduler(num_inference_steps=config.num_inference_steps)
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
         ctx.before_loop(latents)
-        predict = self._predict(self.transformer)
-        for t in config.time_steps:
-            try:
-                velocity = predict(
-                    latents=latents,
-                    latent_ids=latent_ids,
-                    text_tokens=text_tokens,
-                    text_ids=text_ids,
-                    uncond_tokens=uncond_tokens,
-                    uncond_ids=uncond_ids,
-                    cond_tokens=cond_tokens,
-                    cond_ids=cond_ids,
-                    guidance=guidance,
-                    timestep=scheduler.timesteps[t : t + 1],
-                    target_timestep=scheduler.timesteps[t + 1 : t + 2] if flow_map else None,
-                )
-                latents = scheduler.step(latents=latents, velocity=velocity, step=t)
-                ctx.in_loop(t, latents)
-                mx.eval(latents)
-            except KeyboardInterrupt:  # noqa: PERF203
-                ctx.interruption(t, latents)
-                raise StopImageGenerationException(
-                    f"Stopping image generation at step {t + 1}/{config.num_inference_steps}"
-                )
+        with zero_copy.streamed(self.transformer):
+            predict = self._predict(self.transformer)
+            for t in config.time_steps:
+                try:
+                    velocity = predict(
+                        latents=latents,
+                        latent_ids=latent_ids,
+                        text_tokens=text_tokens,
+                        text_ids=text_ids,
+                        uncond_tokens=uncond_tokens,
+                        uncond_ids=uncond_ids,
+                        cond_tokens=cond_tokens,
+                        cond_ids=cond_ids,
+                        guidance=guidance,
+                        timestep=scheduler.timesteps[t : t + 1],
+                        target_timestep=scheduler.timesteps[t + 1 : t + 2] if flow_map else None,
+                    )
+                    latents = scheduler.step(latents=latents, velocity=velocity, step=t)
+                    ctx.in_loop(t, latents)
+                    mx.eval(latents)
+                except KeyboardInterrupt:  # noqa: PERF203
+                    ctx.interruption(t, latents)
+                    raise StopImageGenerationException(
+                        f"Stopping image generation at step {t + 1}/{config.num_inference_steps}"
+                    )
 
-        # The predict closure holds the transformer. Delete it so that --low-ram can free the transformer before decode.
-        del predict
+            # The predict closure holds the transformer. Delete it so that --low-ram can free the transformer before decode,
+            # and so that a streamed transformer drops its weights when the block ends.
+            del predict
+            mx.eval(latents)
         ctx.after_loop(latents)
 
         # 4. Decode latents
